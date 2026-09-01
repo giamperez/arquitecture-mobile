@@ -39,6 +39,9 @@
         "projectId": "b00aa1f0-52c6-4c93-94ff-b243b66d5586"
       }
     },
-    "owner": "giampe"
+    "owner": "giampe",
+    "plugins": [
+      "expo-font"
+    ]
   }
 }
