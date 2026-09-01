@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "Inspect",
+    "slug": "arquitecture-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.psinspect.mobile",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Inspect necesita la cámara para documentar daños estructurales en campo.",
+        "NSLocationWhenInUseUsageDescription": "Inspect necesita tu ubicación para geolocalizar alertas de emergencia SOS."
+      }
+    },
+    "android": {
+      "package": "com.psinspect.mobile",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "b00aa1f0-52c6-4c93-94ff-b243b66d5586"
+      }
+    },
+    "owner": "giampe"
+  }
+}
