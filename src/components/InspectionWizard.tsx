@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   StyleSheet,
   Text,
@@ -11,6 +11,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   useWindowDimensions,
+  Modal,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
@@ -26,7 +27,7 @@ import {
   CONDITION_LABELS,
 } from '../data/observations';
 import { PLAN_LIMITS, type Plan } from '../data/planLimits';
-import PixelTsunami from './PixelTsunami';
+import TsunamiMascot from './TsunamiMascot';
 import { generateAndSharePDF } from '../utils/exportUtils';
 
 const PHOTOS_DIR = `${FileSystem.documentDirectory || ''}inspect_offline_photos/`;
@@ -73,6 +74,7 @@ interface WizardProps {
   onClose: () => void;
   onSuccess: (inspection: any, localPhotos: { uri: string; type: string }[]) => void;
   showToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
+  onAddProject?: (project: any) => void;
 }
 
 export const InspectionWizard: React.FC<WizardProps> = ({
@@ -85,6 +87,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
   onClose,
   onSuccess,
   showToast,
+  onAddProject,
 }) => {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
@@ -95,12 +98,87 @@ export const InspectionWizard: React.FC<WizardProps> = ({
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
 
   // Step 1: Geometry & Identification
-  const [projectId, setProjectId] = useState<number>(activeProjectId || projects[0]?.id || 1);
+  const [projectId, setProjectId] = useState<number>(activeProjectId || projects[0]?.id || 0);
+
+  useEffect(() => {
+    if ((!projectId || !projects.some((p) => p.id === projectId)) && projects.length > 0) {
+      setProjectId(activeProjectId && projects.some((p) => p.id === activeProjectId) ? activeProjectId : projects[0].id);
+    }
+  }, [projects, activeProjectId]);
+
+  // Quick Project Creation Modal State
+  const [showQuickProjectModal, setShowQuickProjectModal] = useState(false);
+  const [newProjName, setNewProjName] = useState('');
+  const [newProjCode, setNewProjCode] = useState('');
+  const [newProjLocation, setNewProjLocation] = useState('');
+  const [newProjClient, setNewProjClient] = useState('');
+  const [creatingProject, setCreatingProject] = useState(false);
+
   const [material, setMaterial] = useState<MaterialKey>('concrete');
   const [elementType, setElementType] = useState<string>(TYPE_OPTIONS.concrete[0]);
   const [code, setCode] = useState('C-01');
   const [axis, setAxis] = useState('Eje A-1');
   const [level, setLevel] = useState('Nivel 01');
+
+  const handleQuickCreateProject = async () => {
+    if (!newProjName.trim()) {
+      showToast('Ingresa el nombre del proyecto u obra.', 'error');
+      return;
+    }
+    if (plan === 'free' && projects.length >= limits.projects) {
+      showToast(`Has alcanzado el límite de ${limits.projects} proyectos del plan Free.`, 'info');
+      return;
+    }
+
+    setCreatingProject(true);
+    const newProjData = {
+      name: newProjName.trim(),
+      code: newProjCode.trim() || `OB-${String(projects.length + 1).padStart(2, '0')}`,
+      location: newProjLocation.trim() || 'Ubicación General',
+      client: newProjClient.trim() || 'General',
+      status: 'En inspección',
+    };
+
+    try {
+      let createdProj: any = null;
+      if (token && token !== 'offline-guest-token') {
+        const res = await fetch('https://inspect.vertexdev.tech/api/projects', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(newProjData),
+        });
+        if (res.ok) {
+          createdProj = await res.json();
+        }
+      }
+
+      if (!createdProj) {
+        createdProj = {
+          id: Date.now(),
+          ...newProjData,
+          createdAt: new Date().toISOString(),
+        };
+      }
+
+      if (onAddProject) {
+        onAddProject(createdProj);
+      }
+      setProjectId(createdProj.id);
+      setShowQuickProjectModal(false);
+      setNewProjName('');
+      setNewProjCode('');
+      setNewProjLocation('');
+      setNewProjClient('');
+      showToast(`Proyecto "${createdProj.name}" creado y asignado.`, 'success');
+    } catch {
+      showToast('Error al registrar el proyecto.', 'error');
+    } finally {
+      setCreatingProject(false);
+    }
+  };
 
   // Step 2: Pathologies & Severities
   const [selectedObs, setSelectedObs] = useState<Record<string, number>>({});
@@ -206,6 +284,10 @@ export const InspectionWizard: React.FC<WizardProps> = ({
 
   // Navigations between steps with validation
   const handleNextStep1 = () => {
+    if (!projectId || projects.length === 0 || !projects.some((p) => p.id === projectId)) {
+      showToast('Debes seleccionar o crear un proyecto de obra antes de continuar.', 'error');
+      return;
+    }
     if (!code.trim() || !axis.trim()) {
       showToast('Por favor completa el código del elemento y el eje.', 'error');
       return;
@@ -401,33 +483,130 @@ export const InspectionWizard: React.FC<WizardProps> = ({
         {step === 1 && (
           <View>
             {/* 1.1 Proyecto Destino */}
-            <View style={styles.sectionHeader}>
-              <Feather name="folder" size={14} color={theme.primary} />
-              <Text style={[styles.sectionTitle, { color: theme.text }]}>Proyecto de la Obra</Text>
+            <View style={styles.projectHeaderRow}>
+              <View style={styles.sectionHeaderNoMargin}>
+                <Feather name="folder" size={15} color={theme.primary} />
+                <Text style={[styles.sectionTitle, { color: theme.text }]}>Proyecto de la Obra</Text>
+              </View>
+
+              {projects.length > 0 && (
+                <TouchableOpacity
+                  style={[styles.addProjQuickBtn, { backgroundColor: theme.isDark ? '#1e293b' : '#eff6ff' }]}
+                  onPress={() => setShowQuickProjectModal(true)}
+                  activeOpacity={0.8}
+                >
+                  <Feather name="plus" size={13} color={theme.primary} />
+                  <Text style={[styles.addProjQuickBtnText, { color: theme.primary }]}>Nueva Obra</Text>
+                </TouchableOpacity>
+              )}
             </View>
 
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.horizontalChips}>
-              {projects.map((p) => {
-                const isSel = projectId === p.id;
-                return (
-                  <TouchableOpacity
-                    key={`wiz-proj-${p.id}`}
-                    style={[
-                      styles.chipItem,
-                      {
-                        backgroundColor: isSel ? theme.primary : theme.card,
-                        borderColor: isSel ? theme.primary : theme.border,
-                      },
-                    ]}
-                    onPress={() => setProjectId(p.id)}
-                  >
-                    <Text style={[styles.chipText, { color: isSel ? '#ffffff' : theme.text }]}>
-                      {p.name}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
+            {projects.length === 0 ? (
+              <View
+                style={[
+                  styles.noProjectWarningCard,
+                  {
+                    backgroundColor: theme.isDark ? '#1e293b' : '#fffbeb',
+                    borderColor: theme.isDark ? '#334155' : '#fde68a',
+                  },
+                ]}
+              >
+                <View style={[styles.noProjectIconBox, { backgroundColor: theme.isDark ? '#0f172a' : '#fef3c7' }]}>
+                  <MaterialCommunityIcons name="office-building-plus" size={24} color="#d97706" />
+                </View>
+                <View style={{ flex: 1, marginLeft: 10, marginRight: 8 }}>
+                  <Text style={[styles.noProjectTitle, { color: theme.isDark ? '#f8fafc' : '#92400e' }]}>
+                    Sin proyectos creados
+                  </Text>
+                  <Text style={[styles.noProjectSub, { color: theme.isDark ? '#cbd5e1' : '#b45309' }]}>
+                    Toda inspección debe asignarse a una obra. Crea la primera para continuar.
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={[styles.createProjectBtnInline, { backgroundColor: theme.primary }]}
+                  onPress={() => setShowQuickProjectModal(true)}
+                  activeOpacity={0.85}
+                >
+                  <Feather name="plus" size={13} color="#ffffff" />
+                  <Text style={styles.createProjectBtnInlineText}>Crear</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={styles.projectChipsScroll}
+                contentContainerStyle={styles.projectChipsContent}
+              >
+                {projects.map((p) => {
+                  const isSel = projectId === p.id;
+                  return (
+                    <TouchableOpacity
+                      key={`wiz-proj-${p.id}`}
+                      style={[
+                        styles.projectChipCard,
+                        {
+                          backgroundColor: isSel ? (theme.isDark ? '#1e3a8a' : '#eff6ff') : theme.card,
+                          borderColor: isSel ? '#2563eb' : theme.border,
+                        },
+                      ]}
+                      onPress={() => setProjectId(p.id)}
+                      activeOpacity={0.85}
+                    >
+                      <View
+                        style={[
+                          styles.projectChipIconBox,
+                          { backgroundColor: isSel ? '#2563eb' : theme.isDark ? '#1e293b' : '#f1f5f9' },
+                        ]}
+                      >
+                        <MaterialCommunityIcons
+                          name="office-building"
+                          size={16}
+                          color={isSel ? '#ffffff' : theme.textSecondary}
+                        />
+                      </View>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text
+                          style={[
+                            styles.projectChipName,
+                            { color: isSel ? '#2563eb' : theme.text, fontWeight: isSel ? '800' : '600' },
+                          ]}
+                          numberOfLines={1}
+                        >
+                          {p.name}
+                        </Text>
+                        <Text
+                          style={[
+                            styles.projectChipSub,
+                            { color: isSel ? '#3b82f6' : theme.textSecondary },
+                          ]}
+                          numberOfLines={1}
+                        >
+                          {p.code || 'OBRA'} {p.location ? `· ${p.location}` : ''}
+                        </Text>
+                      </View>
+                      {isSel && (
+                        <View style={styles.projectCheckCircle}>
+                          <Feather name="check" size={10} color="#ffffff" />
+                        </View>
+                      )}
+                    </TouchableOpacity>
+                  );
+                })}
+
+                <TouchableOpacity
+                  style={[
+                    styles.newProjectChipBtn,
+                    { backgroundColor: theme.cardSecondary, borderColor: theme.border },
+                  ]}
+                  onPress={() => setShowQuickProjectModal(true)}
+                  activeOpacity={0.85}
+                >
+                  <Feather name="plus" size={14} color={theme.primary} />
+                  <Text style={[styles.newProjectChipText, { color: theme.primary }]}>Nueva obra</Text>
+                </TouchableOpacity>
+              </ScrollView>
+            )}
 
             {/* 1.2 Material Estructural (7 Materiales) */}
             <View style={[styles.sectionHeader, { marginTop: 14 }]}>
@@ -882,7 +1061,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
         {step === 4 && createdInsp && (
           <View style={styles.successWrapper}>
             <View style={styles.tsunamiMascotBox}>
-              <PixelTsunami pose="celebrating" pixelSize={4.2} />
+              <TsunamiMascot pose="celebrating" size={120} />
             </View>
 
             <Text style={[styles.successMainTitle, { color: theme.text }]}>
@@ -1006,19 +1185,140 @@ export const InspectionWizard: React.FC<WizardProps> = ({
             {saving ? (
               <ActivityIndicator color="#ffffff" size="small" />
             ) : (
-              <>
-                <Text style={styles.nextNavBtnText}>
-                  {step === 1
-                    ? 'Siguiente: Patologías →'
-                    : step === 2
-                    ? 'Siguiente: Condición y Fotos →'
-                    : '✓ Finalizar y Guardar'}
-                </Text>
-              </>
+              <Text style={styles.nextNavBtnText}>
+                {step === 1
+                  ? 'Siguiente: Patologías →'
+                  : step === 2
+                  ? 'Siguiente: Condición y Fotos →'
+                  : '✓ Finalizar y Guardar'}
+              </Text>
             )}
           </TouchableOpacity>
         </View>
       )}
+
+      {/* ── QUICK CREATE PROJECT MODAL ── */}
+      <Modal
+        visible={showQuickProjectModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowQuickProjectModal(false)}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.modalOverlay}
+        >
+          <View style={[styles.quickProjectModalBox, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <View style={styles.quickModalHeader}>
+              <View style={{ flex: 1, paddingRight: 8 }}>
+                <Text style={[styles.quickModalTitle, { color: theme.text }]}>Nueva Obra / Proyecto</Text>
+                <Text style={[styles.quickModalSub, { color: theme.textSecondary }]}>
+                  Registra la edificación para asociar esta y futuras inspecciones
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setShowQuickProjectModal(false)}
+                style={[styles.quickModalCloseBtn, { backgroundColor: theme.cardSecondary }]}
+              >
+                <Feather name="x" size={16} color={theme.text} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={{ maxHeight: 380 }} showsVerticalScrollIndicator={false}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text style={[styles.quickModalInputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>
+                  NOMBRE DEL PROYECTO / EDIFICIO <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>*</Text>
+                </Text>
+                <View style={{ backgroundColor: '#ef444415', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                  <Text style={{ fontSize: 9, color: '#ef4444', fontWeight: '800' }}>OBLIGATORIO</Text>
+                </View>
+              </View>
+              <TextInput
+                style={[
+                  styles.quickModalInput,
+                  { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text },
+                ]}
+                placeholder="Ej. Centro de Salud Baños del Inca"
+                placeholderTextColor={theme.textMuted}
+                value={newProjName}
+                onChangeText={setNewProjName}
+              />
+
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text style={[styles.quickModalInputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>
+                  CÓDIGO DE OBRA
+                </Text>
+                <Text style={{ fontSize: 9, color: theme.textMuted, fontWeight: '600' }}>OPCIONAL</Text>
+              </View>
+              <TextInput
+                style={[
+                  styles.quickModalInput,
+                  { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text },
+                ]}
+                placeholder="Ej. CS-01"
+                placeholderTextColor={theme.textMuted}
+                value={newProjCode}
+                onChangeText={setNewProjCode}
+              />
+
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text style={[styles.quickModalInputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>
+                  UBICACIÓN / CIUDAD
+                </Text>
+                <Text style={{ fontSize: 9, color: theme.textMuted, fontWeight: '600' }}>OPCIONAL</Text>
+              </View>
+              <TextInput
+                style={[
+                  styles.quickModalInput,
+                  { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text },
+                ]}
+                placeholder="Ej. Cajamarca"
+                placeholderTextColor={theme.textMuted}
+                value={newProjLocation}
+                onChangeText={setNewProjLocation}
+              />
+
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text style={[styles.quickModalInputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>
+                  CLIENTE / PROPIETARIO
+                </Text>
+                <Text style={{ fontSize: 9, color: theme.textMuted, fontWeight: '600' }}>OPCIONAL</Text>
+              </View>
+              <TextInput
+                style={[
+                  styles.quickModalInput,
+                  { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text },
+                ]}
+                placeholder="Ej. MINSA / Privado"
+                placeholderTextColor={theme.textMuted}
+                value={newProjClient}
+                onChangeText={setNewProjClient}
+              />
+
+              <View style={styles.quickModalButtonsRow}>
+                <TouchableOpacity
+                  style={[styles.quickModalCancelBtn, { backgroundColor: theme.cardSecondary }]}
+                  onPress={() => setShowQuickProjectModal(false)}
+                >
+                  <Text style={[styles.quickModalCancelBtnText, { color: theme.text }]}>Cancelar</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.quickModalCreateBtn, { backgroundColor: theme.primary }]}
+                  onPress={handleQuickCreateProject}
+                  disabled={creatingProject}
+                >
+                  {creatingProject ? (
+                    <ActivityIndicator color="#ffffff" size="small" />
+                  ) : (
+                    <Text style={styles.quickModalCreateBtnText}>Crear y Asignar</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </KeyboardAvoidingView>
   );
 };
@@ -1555,6 +1855,207 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '900',
     letterSpacing: 0.3,
+  },
+
+  // Project Selection & Warning
+  projectHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  sectionHeaderNoMargin: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  addProjQuickBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    gap: 4,
+  },
+  addProjQuickBtnText: {
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  noProjectWarningCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 10,
+  },
+  noProjectIconBox: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  noProjectTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  noProjectSub: {
+    fontSize: 10.5,
+    marginTop: 2,
+    lineHeight: 14,
+  },
+  createProjectBtnInline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    gap: 4,
+  },
+  createProjectBtnInlineText: {
+    color: '#ffffff',
+    fontSize: 11.5,
+    fontWeight: '800',
+  },
+  projectChipsScroll: {
+    marginBottom: 10,
+  },
+  projectChipsContent: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingRight: 12,
+  },
+  projectChipCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    gap: 8,
+    minWidth: 150,
+    maxWidth: 220,
+  },
+  projectChipIconBox: {
+    width: 28,
+    height: 28,
+    borderRadius: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  projectChipName: {
+    fontSize: 12,
+  },
+  projectChipSub: {
+    fontSize: 10,
+    marginTop: 1,
+  },
+  projectCheckCircle: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#2563eb',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  newProjectChipBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    gap: 6,
+    justifyContent: 'center',
+  },
+  newProjectChipText: {
+    fontSize: 11,
+    fontWeight: '800',
+  },
+
+  // Quick Project Modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 18,
+  },
+  quickProjectModalBox: {
+    width: '100%',
+    maxWidth: 400,
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    elevation: 10,
+  },
+  quickModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 14,
+    borderBottomWidth: 0.5,
+    borderBottomColor: 'rgba(150,150,150,0.2)',
+    paddingBottom: 10,
+  },
+  quickModalTitle: {
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  quickModalSub: {
+    fontSize: 11,
+    marginTop: 2,
+  },
+  quickModalCloseBtn: {
+    padding: 6,
+    borderRadius: 14,
+  },
+  quickModalInputLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  quickModalInput: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+    marginBottom: 10,
+  },
+  quickModalButtonsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  quickModalCancelBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  quickModalCancelBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  quickModalCreateBtn: {
+    flex: 1.5,
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  quickModalCreateBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '900',
   },
 });
 

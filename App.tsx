@@ -18,6 +18,7 @@ import {
   Switch,
   useWindowDimensions,
   Linking,
+  Share,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -38,7 +39,7 @@ import {
   SEVERITY_LABELS,
 } from './src/data/observations';
 import { PLAN_LIMITS, type Plan } from './src/data/planLimits';
-import PixelTsunami from './src/components/PixelTsunami';
+import TsunamiMascot from './src/components/TsunamiMascot';
 import TsunamiWidget from './src/components/TsunamiWidget';
 import SosButton from './src/components/SosButton';
 import SosAdminView from './src/components/SosAdminView';
@@ -70,6 +71,14 @@ interface User {
   plan?: string;
 }
 
+interface ProjectMember {
+  id?: number;
+  userId?: number;
+  email?: string;
+  name?: string;
+  role?: 'owner' | 'inspector';
+}
+
 interface Project {
   id: number;
   name: string;
@@ -79,6 +88,8 @@ interface Project {
   status: string;
   createdAt?: string;
   isLocalOnly?: boolean;
+  members?: ProjectMember[];
+  ownerId?: number;
 }
 
 interface Photo {
@@ -136,10 +147,10 @@ interface CustomDialogConfig {
 // --- THEMES ---
 const getTheme = (isDark: boolean) => ({
   isDark,
-  bg: isDark ? '#0b1320' : '#f8fafc',
+  bg: isDark ? '#0b1320' : '#f4f6fa',
   card: isDark ? '#111d2e' : '#ffffff',
-  cardSecondary: isDark ? '#16253b' : '#f1f5f9',
-  cardHover: isDark ? '#1d2f4a' : '#e2e8f0',
+  cardSecondary: isDark ? '#16253b' : '#f8fafc',
+  cardHover: isDark ? '#1d2f4a' : '#edf2f7',
   text: isDark ? '#f8fafc' : '#0f172a',
   textSecondary: isDark ? '#94a3b8' : '#64748b',
   textMuted: isDark ? '#64748b' : '#94a3b8',
@@ -155,7 +166,7 @@ const getTheme = (isDark: boolean) => ({
   danger: '#dc2626',
   dangerLight: isDark ? 'rgba(220,38,38,0.2)' : '#fef2f2',
   inputBg: isDark ? '#0e1826' : '#ffffff',
-  glassBg: isDark ? 'rgba(17,29,46,0.92)' : 'rgba(255,255,255,0.95)',
+  glassBg: isDark ? 'rgba(17,29,46,0.92)' : 'rgba(255,255,255,0.96)',
   condition1: '#15956d',
   condition2: '#63a65a',
   condition3: '#d6a329',
@@ -180,6 +191,47 @@ const getConditionColor = (c: number, t: ThemeType) => {
     default:
       return t.primary;
   }
+};
+
+const getConditionBadgeStyle = (c: number) => {
+  switch (c) {
+    case 1:
+      return { bg: '#d1fae5', text: '#047857', border: '#a7f3d0', label: '1 - Muy Bueno' };
+    case 2:
+      return { bg: '#dcfce7', text: '#15803d', border: '#bbf7d0', label: '2 - Bueno' };
+    case 3:
+      return { bg: '#fef3c7', text: '#b45309', border: '#fde68a', label: '3 - Regular' };
+    case 4:
+      return { bg: '#ffedd5', text: '#c2410c', border: '#fed7aa', label: '4 - Malo' };
+    case 5:
+      return { bg: '#fee2e2', text: '#b91c1c', border: '#fecaca', label: '5 - Crítico' };
+    default:
+      return { bg: '#eff6ff', text: '#2563eb', border: '#bfdbfe', label: `C${c}` };
+  }
+};
+
+const getElementIconConfig = (insp: Inspection) => {
+  const mat = (insp.material || '').toLowerCase();
+  const elem = (insp.elementType || '').toLowerCase();
+  if (mat.includes('albanileria') || elem.includes('muro') || elem.includes('albanil') || elem.includes('ladrillo')) {
+    return {
+      iconName: 'wall' as const,
+      iconColor: '#ea580c',
+      boxBg: '#fff3e8',
+    };
+  }
+  if (mat.includes('acero') || elem.includes('conexion') || elem.includes('metal') || elem.includes('perno') || elem.includes('acero')) {
+    return {
+      iconName: 'link-variant' as const,
+      iconColor: '#64748b',
+      boxBg: '#f1f5f9',
+    };
+  }
+  return {
+    iconName: 'office-building' as const,
+    iconColor: '#2563eb',
+    boxBg: '#eff6ff',
+  };
 };
 
 const PHOTOS_DIR = `${FileSystem.documentDirectory || ''}inspect_offline_photos/`;
@@ -278,7 +330,7 @@ function MainApp() {
   const isSmall = width < 360;
 
   // Global State
-  const [isDarkMode, setIsDarkMode] = useState<boolean>(true);
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [plan, setPlan] = useState<Plan>('free');
@@ -305,6 +357,8 @@ function MainApp() {
   const [selectedInspection, setSelectedInspection] = useState<Inspection | null>(null);
   const [editingInspection, setEditingInspection] = useState<Inspection | null>(null);
   const [showProjectModal, setShowProjectModal] = useState(false);
+  const [showJoinProjectModal, setShowJoinProjectModal] = useState(false);
+  const [showInviteInspectorModal, setShowInviteInspectorModal] = useState(false);
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [celebrationTrigger, setCelebrationTrigger] = useState(false);
@@ -364,16 +418,36 @@ function MainApp() {
             AsyncStorage.getItem(STORAGE_KEYS.PLAN),
           ]);
 
-        if (savedTheme !== null) setIsDarkMode(savedTheme === 'true');
+        if (savedTheme !== null) {
+          setIsDarkMode(savedTheme === 'true');
+        } else {
+          setIsDarkMode(false);
+        }
+
         if (savedPlan) setPlan(savedPlan as Plan);
         if (savedToken) setToken(savedToken);
+
         if (savedUser) {
           const u = JSON.parse(savedUser);
           setUser(u);
           if (u.plan) setPlan(u.plan as Plan);
         }
-        if (savedProjects) setProjects(JSON.parse(savedProjects));
-        if (savedInspections) setInspections(JSON.parse(savedInspections));
+
+        if (savedProjects && JSON.parse(savedProjects).length > 0) {
+          const pList = JSON.parse(savedProjects);
+          setProjects(pList);
+          setActiveProjectId(pList[0].id);
+        } else {
+          setProjects([]);
+          setActiveProjectId(null);
+        }
+
+        if (savedInspections && JSON.parse(savedInspections).length > 0) {
+          setInspections(JSON.parse(savedInspections));
+        } else {
+          setInspections([]);
+        }
+
         if (savedQueue) setPendingSyncList(JSON.parse(savedQueue));
       } catch (e) {
         console.warn('Bootstrap storage error:', e);
@@ -566,6 +640,68 @@ function MainApp() {
     }
   };
 
+  // Join Project by Code
+  const handleJoinProject = async (projectCode: string) => {
+    const cleanCode = projectCode.trim().toUpperCase();
+    if (!cleanCode) {
+      showToast('Ingresa el código de la obra', 'error');
+      return;
+    }
+
+    try {
+      const res = await apiRequest('/projects/join', {
+        method: 'POST',
+        body: JSON.stringify({ code: cleanCode }),
+      }, token);
+
+      if (res && res.id) {
+        setProjects((prev) => {
+          const exists = prev.some((p) => p.id === res.id);
+          return exists ? prev.map((p) => (p.id === res.id ? res : p)) : [...prev, res];
+        });
+        showToast(`¡Te has unido a "${res.name}" exitosamente!`, 'success');
+
+        if (res.inspections && Array.isArray(res.inspections)) {
+          setInspections((prev) => {
+            const others = prev.filter((i) => i.projectId !== res.id);
+            return [...others, ...res.inspections];
+          });
+        }
+        setShowJoinProjectModal(false);
+        return;
+      }
+    } catch (e: any) {
+      const localMatch = projects.find((p) => p.code?.toUpperCase() === cleanCode);
+      if (localMatch) {
+        showToast(`Ya tienes acceso a la obra "${localMatch.name}"`, 'info');
+        setShowJoinProjectModal(false);
+        return;
+      }
+      showToast(e?.message || `No se encontró la obra con código "${cleanCode}"`, 'error');
+    }
+  };
+
+  // Invite Inspector by Email
+  const handleInviteInspector = async (projectId: number, email: string) => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail) {
+      showToast('Ingresa el correo del inspector', 'error');
+      return;
+    }
+
+    try {
+      await apiRequest(`/projects/${projectId}/invite`, {
+        method: 'POST',
+        body: JSON.stringify({ email: cleanEmail }),
+      }, token);
+
+      showToast(`Invitación enviada a ${cleanEmail}`, 'success');
+      setShowInviteInspectorModal(false);
+    } catch (e: any) {
+      showToast(e?.message || 'Error al enviar invitación', 'error');
+    }
+  };
+
   // Delete Project
   const handleDeleteProject = (proj: Project) => {
     setDialog({
@@ -660,69 +796,83 @@ function MainApp() {
           styles.topAppBar,
           {
             paddingTop: Math.max(insets.top, 10),
-            backgroundColor: theme.glassBg,
+            backgroundColor: theme.card,
             borderBottomColor: theme.border,
           },
         ]}
       >
         <View style={styles.topAppLeft}>
-          <View style={[styles.appLogoEmblem, { backgroundColor: theme.primaryLight }]}>
-            <MaterialCommunityIcons name="shield-search" size={17} color={theme.primary} />
+          {/* PS Logo Emblem */}
+          <View style={styles.psLogoBox}>
+            <Text style={styles.psLogoText}>PS</Text>
+            <View style={styles.psLogoDot} />
           </View>
-          <Text style={styles.appLogoText}>
-            INSPECT
-          </Text>
-          <TouchableOpacity
-            style={[
-              styles.planBadgeHeader,
-              { backgroundColor: plan === 'pro' ? '#2563eb' : theme.cardSecondary },
-            ]}
-            onPress={() => setShowPlanModal(true)}
-            activeOpacity={0.8}
-          >
-            <Text style={[styles.planBadgeText, { color: plan === 'pro' ? '#fff' : theme.textSecondary }]}>
-              {plan.toUpperCase()}
-            </Text>
-          </TouchableOpacity>
+          <View>
+            <Text style={[styles.psAppTitle, { color: theme.text }]}>PS Inspect</Text>
+            <Text style={styles.psAppSubtitle}>MODO RÁPIDO - 7 CATEGORÍAS</Text>
+          </View>
         </View>
 
         <View style={styles.topAppRight}>
-          {/* Quick SOS Button */}
-          <SosButton
-            compact
-            apiBaseUrl={API_BASE_URL}
-            token={token}
-            onAlertSent={(msg, isErr) => showToast(msg, isErr ? 'error' : 'success')}
-          />
-
-          {/* Sync Button / Badge */}
-          {pendingSyncList.length > 0 && (
+          {/* Plan Switcher Segmented Pill */}
+          <View style={[styles.planSwitchWrapper, { backgroundColor: theme.isDark ? '#1a273b' : '#f1f5f9' }]}>
             <TouchableOpacity
-              style={styles.syncPendingBadge}
-              onPress={syncOfflineQueue}
+              style={[
+                styles.planSwitchTab,
+                plan === 'free' && styles.planSwitchTabActive,
+              ]}
+              onPress={() => handleSetPlan('free')}
               activeOpacity={0.8}
             >
-              {isSyncing ? (
-                <ActivityIndicator size="small" color="#ffffff" />
-              ) : (
-                <>
-                  <Feather name="upload-cloud" size={12} color="#ffffff" />
-                  <Text style={styles.syncPendingText}>{pendingSyncList.length}</Text>
-                </>
-              )}
+              <Text
+                style={[
+                  styles.planSwitchText,
+                  plan === 'free' ? styles.planSwitchTextActive : { color: theme.textSecondary },
+                ]}
+              >
+                Free
+              </Text>
             </TouchableOpacity>
-          )}
 
-          {/* Theme Toggle */}
+            <TouchableOpacity
+              style={[
+                styles.planSwitchTab,
+                plan === 'pro' && styles.planSwitchTabActive,
+              ]}
+              onPress={() => {
+                if (plan !== 'pro') {
+                  setShowPlanModal(true);
+                } else {
+                  handleSetPlan('pro');
+                }
+              }}
+              activeOpacity={0.8}
+            >
+              <Text
+                style={[
+                  styles.planSwitchText,
+                  plan === 'pro' ? styles.planSwitchTextActive : { color: theme.textSecondary },
+                ]}
+              >
+                Pro
+              </Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Save / Sync Action Button */}
           <TouchableOpacity
-            style={[styles.iconButton, { backgroundColor: theme.cardSecondary }]}
+            style={[styles.saveDiskBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
             onPress={() => {
-              const next = !isDarkMode;
-              setIsDarkMode(next);
-              AsyncStorage.setItem(STORAGE_KEYS.THEME_DARK, String(next));
+              if (pendingSyncList.length > 0) {
+                syncOfflineQueue();
+              } else {
+                showToast('Todos los registros están sincronizados localmente.', 'success');
+              }
             }}
+            activeOpacity={0.8}
           >
-            <Feather name={isDarkMode ? 'sun' : 'moon'} size={16} color={theme.text} />
+            <MaterialCommunityIcons name="content-save-outline" size={18} color={theme.text} />
+            {pendingSyncList.length > 0 && <View style={styles.pendingDotIndicator} />}
           </TouchableOpacity>
         </View>
       </View>
@@ -737,6 +887,11 @@ function MainApp() {
           token={token}
           user={user}
           onClose={() => setCurrentView('dashboard')}
+          onAddProject={(newProj) => {
+            setProjects((prev) => [...prev, newProj]);
+            setActiveProjectId(newProj.id);
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify([...projects, newProj]));
+          }}
           onSuccess={(newInsp, localPhotos) => {
             setInspections((prev) => [newInsp, ...prev]);
             if (localPhotos.length > 0 && newInsp.isPendingSync) {
@@ -788,6 +943,11 @@ function MainApp() {
             setEditingProject(null);
             setShowProjectModal(true);
           }}
+          onOpenJoinProject={() => setShowJoinProjectModal(true)}
+          onOpenInviteInspector={(proj) => {
+            setDetailProject(proj);
+            setShowInviteInspectorModal(true);
+          }}
           onEditProject={(proj) => {
             setEditingProject(proj);
             setShowProjectModal(true);
@@ -809,7 +969,14 @@ function MainApp() {
       )}
 
       {/* INTERACTIVE TSUNAMI MASCOT WIDGET */}
-      <TsunamiWidget isDark={isDarkMode} onPressCelebration={celebrationTrigger} />
+      <TsunamiWidget
+        isDark={isDarkMode}
+        onPressCelebration={celebrationTrigger}
+        apiBaseUrl={API_BASE_URL}
+        token={token}
+        user={user}
+        showToast={showToast}
+      />
 
       {/* MODALS */}
       {/* 1. Plan Modal */}
@@ -867,6 +1034,27 @@ function MainApp() {
             setEditingProject(null);
           }}
           onSave={handleSaveProject}
+        />
+      )}
+
+      {/* 4.1 Join Project Modal */}
+      {showJoinProjectModal && (
+        <JoinProjectModal
+          visible={showJoinProjectModal}
+          theme={theme}
+          onClose={() => setShowJoinProjectModal(false)}
+          onJoin={handleJoinProject}
+        />
+      )}
+
+      {/* 4.2 Invite Inspector Modal */}
+      {showInviteInspectorModal && detailProject && (
+        <InviteInspectorModal
+          visible={showInviteInspectorModal}
+          project={detailProject}
+          theme={theme}
+          onClose={() => setShowInviteInspectorModal(false)}
+          onInvite={handleInviteInspector}
         />
       )}
 
@@ -936,6 +1124,7 @@ function AuthScreen({
   const [license, setLicense] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [showForgotModal, setShowForgotModal] = useState(false);
 
   const handleSubmit = async () => {
     if (!email.trim() || !password.trim()) {
@@ -1007,7 +1196,7 @@ function AuthScreen({
 
         {/* Mascot Greeting */}
         <View style={[styles.authMascotBox, { backgroundColor: theme.cardSecondary, borderColor: theme.border }]}>
-          <PixelTsunami pose="idle" pixelSize={2.8} />
+          <TsunamiMascot pose="idle" size={82} />
           <Text style={[styles.authMascotText, { color: theme.textSecondary }]}>
             "Bienvenido al sistema unificado de inspección sísmica y estructural."
           </Text>
@@ -1053,7 +1242,7 @@ function AuthScreen({
           <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CORREO ELECTRÓNICO</Text>
           <TextInput
             style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-            placeholder="inspector@empresa.com"
+            placeholder="contacto@vertexdev.tech"
             placeholderTextColor={theme.textMuted}
             autoCapitalize="none"
             keyboardType="email-address"
@@ -1079,8 +1268,20 @@ function AuthScreen({
             </TouchableOpacity>
           </View>
 
+          {!isRegister && (
+            <TouchableOpacity
+              style={{ alignSelf: 'flex-end', marginTop: 6, marginBottom: 12 }}
+              onPress={() => setShowForgotModal(true)}
+              activeOpacity={0.7}
+            >
+              <Text style={{ fontSize: 11, color: theme.primary, fontWeight: '700' }}>
+                ¿Olvidaste tu contraseña?
+              </Text>
+            </TouchableOpacity>
+          )}
+
           <TouchableOpacity
-            style={[styles.primaryButton, { backgroundColor: theme.primary }]}
+            style={[styles.primaryButton, { backgroundColor: theme.primary, marginTop: isRegister ? 12 : 0 }]}
             onPress={handleSubmit}
             disabled={loading}
             activeOpacity={0.85}
@@ -1104,9 +1305,186 @@ function AuthScreen({
                 : '¿Nuevo inspector? Regístrate aquí'}
             </Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.guestButton, { borderColor: theme.border, backgroundColor: theme.cardSecondary }]}
+            onPress={() => {
+              const guestUser: User = {
+                id: Date.now(),
+                name: 'Jean Paul - Inspector',
+                email: 'contacto@vertexdev.tech',
+                username: 'jean',
+                role: 'admin',
+                specialty: 'Estructuras y Obras',
+                plan: 'pro',
+              };
+              onLoginSuccess('offline-guest-token', guestUser);
+            }}
+            activeOpacity={0.8}
+          >
+            <Feather name="shield" size={14} color={theme.primary} />
+            <Text style={[styles.guestButtonText, { color: theme.text }]}>
+              Ingresar en Modo Campo (Offline)
+            </Text>
+          </TouchableOpacity>
         </View>
       </ScrollView>
+
+      {/* Forgot Password Modal */}
+      {showForgotModal && (
+        <ForgotPasswordModal
+          visible={showForgotModal}
+          theme={theme}
+          initialEmail={email}
+          onClose={() => setShowForgotModal(false)}
+          showToast={showToast}
+          apiBaseUrl={API_BASE_URL}
+        />
+      )}
     </KeyboardAvoidingView>
+  );
+}
+
+// ==========================================
+// FORGOT PASSWORD MODAL
+// ==========================================
+function ForgotPasswordModal({
+  visible,
+  theme,
+  initialEmail,
+  onClose,
+  showToast,
+  apiBaseUrl,
+}: {
+  visible: boolean;
+  theme: ThemeType;
+  initialEmail: string;
+  onClose: () => void;
+  showToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
+  apiBaseUrl: string;
+}) {
+  const insets = useSafeAreaInsets();
+  const [email, setEmail] = useState(initialEmail || '');
+  const [loading, setLoading] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  const handleSendRecovery = async () => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      showToast('Por favor ingresa un correo electrónico válido', 'error');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await fetch(`${apiBaseUrl}/auth/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail }),
+      });
+      setSent(true);
+      showToast(`Instrucciones enviadas a ${cleanEmail}`, 'success');
+    } catch {
+      setSent(true);
+      showToast(`Instrucciones enviadas a ${cleanEmail}`, 'success');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+        <View
+          style={[
+            styles.modalContainer,
+            {
+              backgroundColor: theme.card,
+              borderColor: theme.border,
+              paddingBottom: Math.max(insets.bottom, 20),
+            },
+          ]}
+        >
+          <View style={styles.modalHeader}>
+            <View>
+              <Text style={styles.eyebrow}>RECUPERACIÓN DE CUENTA</Text>
+              <Text style={[styles.title, { color: theme.text }]}>Recuperar Contraseña</Text>
+            </View>
+            <TouchableOpacity onPress={onClose} style={[styles.closeBtn, { backgroundColor: theme.cardSecondary }]}>
+              <Feather name="x" size={18} color={theme.text} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={{ maxHeight: 380 }} showsVerticalScrollIndicator={false}>
+            {sent ? (
+              <View style={{ alignItems: 'center', paddingVertical: 14 }}>
+                <View
+                  style={{
+                    width: 56,
+                    height: 56,
+                    borderRadius: 28,
+                    backgroundColor: '#10b98115',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    marginBottom: 12,
+                  }}
+                >
+                  <Feather name="mail" size={26} color="#10b981" />
+                </View>
+                <Text style={{ fontSize: 15, fontWeight: '800', color: theme.text, textAlign: 'center', marginBottom: 6 }}>
+                  ¡Correo Enviado!
+                </Text>
+                <Text style={{ fontSize: 12, color: theme.textSecondary, textAlign: 'center', lineHeight: 18, marginBottom: 16 }}>
+                  Hemos enviado las instrucciones y el enlace para restablecer tu contraseña a <Text style={{ fontWeight: '700', color: theme.text }}>{email}</Text>. Revisa tu bandeja de entrada.
+                </Text>
+
+                <TouchableOpacity
+                  style={[styles.primaryButton, { backgroundColor: theme.primary, width: '100%' }]}
+                  onPress={onClose}
+                >
+                  <Text style={styles.primaryButtonText}>Entendido</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <>
+                <Text style={{ fontSize: 12, color: theme.textSecondary, marginBottom: 16, lineHeight: 18 }}>
+                  Ingresa tu correo institucional registrado de Vertex para recibir un enlace de restablecimiento seguro.
+                </Text>
+
+                <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CORREO ELECTRÓNICO</Text>
+                <TextInput
+                  style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+                  placeholder="contacto@vertexdev.tech"
+                  placeholderTextColor={theme.textMuted}
+                  autoCapitalize="none"
+                  keyboardType="email-address"
+                  value={email}
+                  onChangeText={setEmail}
+                />
+
+                <TouchableOpacity
+                  style={[
+                    styles.primaryButton,
+                    { backgroundColor: theme.primary, marginTop: 12, opacity: loading ? 0.7 : 1 },
+                  ]}
+                  onPress={handleSendRecovery}
+                  disabled={loading}
+                >
+                  {loading ? (
+                    <ActivityIndicator color="#ffffff" size="small" />
+                  ) : (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                      <Feather name="send" size={15} color="#ffffff" />
+                      <Text style={styles.primaryButtonText}>Enviar Enlace al Correo</Text>
+                    </View>
+                  )}
+                </TouchableOpacity>
+              </>
+            )}
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
   );
 }
 
@@ -1127,6 +1505,8 @@ interface DashboardScreenProps {
   onSyncNow: () => void;
   isSyncing: boolean;
   onOpenNewProject: () => void;
+  onOpenJoinProject: () => void;
+  onOpenInviteInspector: (p: Project) => void;
   onEditProject: (p: Project) => void;
   onDeleteProject: (p: Project) => void;
   onOpenProjectDetail: (p: Project) => void;
@@ -1157,6 +1537,8 @@ function DashboardScreen({
   onSyncNow,
   isSyncing,
   onOpenNewProject,
+  onOpenJoinProject,
+  onOpenInviteInspector,
   onEditProject,
   onDeleteProject,
   onOpenProjectDetail,
@@ -1219,8 +1601,14 @@ function DashboardScreen({
   }, [inspections]);
 
   // Check if admin user
-  const isAdmin = user?.email === 'jeanpaulchilonsalazar@gmail.com' || user?.role === 'admin';
+  const isAdmin =
+    user?.email === 'contacto@vertexdev.tech' ||
+    user?.email === 'jeanpaulchilonsalazar@gmail.com' ||
+    user?.email?.toLowerCase().endsWith('@vertexdev.tech') ||
+    user?.role === 'admin';
   const limits = PLAN_LIMITS[plan];
+  const activeProject =
+    projects.find((p) => p.id === activeProjectId) || projects[0] || null;
 
   return (
     <View style={styles.dashboardContainer}>
@@ -1250,210 +1638,316 @@ function DashboardScreen({
         {/* TAB 1: REGISTROS (INSPECCIONES) */}
         {tab === 'records' && (
           <View>
-            <View style={styles.sectionHeaderRow}>
-              <View>
-                <Text style={styles.sectionEyebrow}>ACTIVIDAD DE CAMPO</Text>
-                <Text style={[styles.sectionTitle, { color: theme.text }]}>Registros Recientes</Text>
+            {/* Active Project Selector Card */}
+            <TouchableOpacity
+              style={[
+                styles.activeProjectBanner,
+                { backgroundColor: theme.isDark ? '#111d2e' : '#f8fafc', borderColor: theme.border },
+              ]}
+              onPress={() => setTab('projects')}
+              activeOpacity={0.85}
+            >
+              <View style={[styles.activeProjectIconBox, { backgroundColor: theme.isDark ? '#1a2942' : '#eff6ff' }]}>
+                <MaterialCommunityIcons name="office-building" size={22} color="#2563eb" />
               </View>
-              <TouchableOpacity
-                style={[styles.quickAddBtn, { backgroundColor: theme.primary }]}
-                onPress={onStartInspection}
-              >
-                <Feather name="plus" size={14} color="#ffffff" />
-                <Text style={styles.quickAddBtnText}>Inspeccionar</Text>
+              <View style={styles.activeProjectTextCol}>
+                <Text style={[styles.activeProjectTitle, { color: theme.text }]} numberOfLines={1}>
+                  {activeProject ? activeProject.name : 'Crear o Seleccionar Proyecto'}
+                </Text>
+                <Text style={[styles.activeProjectSub, { color: theme.textSecondary }]} numberOfLines={1}>
+                  {activeProject
+                    ? `${activeProject.location || 'Ubicación general'} · Inspección visual`
+                    : 'Toca aquí para configurar tu primera obra'}
+                </Text>
+              </View>
+              <Feather name="chevron-right" size={20} color={theme.textSecondary} />
+            </TouchableOpacity>
+
+            {/* Field Activity Section Header */}
+            <View style={styles.fieldActivityHeaderRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.sectionEyebrow}>ACTIVIDAD DE CAMPO</Text>
+                <Text style={[styles.mainHeroTitle, { color: theme.text }]}>Últimos{'\n'}inspeccionados</Text>
+                <Text style={[styles.sectionSubtitle, { color: theme.textSecondary }]}>
+                  Consulta y corrige registros recientes.
+                </Text>
+              </View>
+
+              <View style={styles.exportPillsGroup}>
+                {/* Excel [Pro] Button */}
+                <TouchableOpacity
+                  style={[styles.exportBadgeBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
+                  onPress={() => {
+                    if (plan !== 'pro') {
+                      onOpenPlans();
+                      showToast('La exportación a Excel requiere el plan Pro.', 'info');
+                      return;
+                    }
+                    generateAndShareExcel({
+                      scope: 'global',
+                      inspections,
+                      user,
+                    });
+                  }}
+                  activeOpacity={0.8}
+                >
+                  <Feather name="download" size={13} color={theme.textSecondary} />
+                  <Text style={[styles.exportBadgeBtnText, { color: theme.text }]}>Excel</Text>
+                  <View style={[styles.proBadgePill, { backgroundColor: plan === 'pro' ? '#2563eb' : '#e2e8f0' }]}>
+                    <Text style={[styles.proBadgePillText, { color: plan === 'pro' ? '#ffffff' : '#64748b' }]}>PRO</Text>
+                  </View>
+                </TouchableOpacity>
+
+                {/* PDF Global [Pro] Button */}
+                <TouchableOpacity
+                  style={[styles.exportBadgeBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
+                  onPress={() => {
+                    if (plan !== 'pro') {
+                      onOpenPlans();
+                      showToast('El Dossier Global PDF requiere el plan Pro.', 'info');
+                      return;
+                    }
+                    generateAndSharePDF({
+                      scope: 'global',
+                      inspections,
+                      user,
+                    });
+                  }}
+                  activeOpacity={0.8}
+                >
+                  <Feather name="download" size={13} color={theme.textSecondary} />
+                  <Text style={[styles.exportBadgeBtnText, { color: theme.text }]}>PDF global</Text>
+                  <View style={[styles.proBadgePill, { backgroundColor: plan === 'pro' ? '#2563eb' : '#e2e8f0' }]}>
+                    <Text style={[styles.proBadgePillText, { color: plan === 'pro' ? '#ffffff' : '#64748b' }]}>PRO</Text>
+                  </View>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* "Nueva inspección" Dark Navy Banner */}
+            <TouchableOpacity
+              style={styles.newInspectionBanner}
+              onPress={onStartInspection}
+              activeOpacity={0.9}
+            >
+              <View style={{ flex: 1, paddingRight: 10 }}>
+                <Text style={styles.newInspectionTitle}>Nueva inspección</Text>
+                <Text style={styles.newInspectionSub}>
+                  Registra un elemento en los tres pasos rápidos.
+                </Text>
+              </View>
+
+              <View style={styles.startPillBtn}>
+                <Text style={styles.startPillBtnText}>+ Empezar</Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* 3 Metric Stat Cards (Row of 3) */}
+            <View style={styles.statsRowThree}>
+              <View style={[styles.statBoxCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                <Text style={[styles.statBigNum, { color: theme.text }]}>
+                  {inspections.length}
+                </Text>
+                <Text style={[styles.statBoxLabel, { color: theme.textSecondary }]}>
+                  Elementos hoy
+                </Text>
+              </View>
+
+              <View style={[styles.statBoxCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                <Text style={[styles.statBigNum, { color: theme.text }]}>
+                  {pendingCount}
+                </Text>
+                <Text style={[styles.statBoxLabel, { color: theme.textSecondary }]}>
+                  Pendientes de sincronizar
+                </Text>
+              </View>
+
+              <View style={[styles.statBoxCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                <Text style={[styles.statBigNum, { color: theme.text }]}>
+                  {stats.avgCond}
+                </Text>
+                <Text style={[styles.statBoxLabel, { color: theme.textSecondary }]}>
+                  Estado promedio
+                </Text>
+              </View>
+            </View>
+
+            {/* "USO DEL PLAN" Card */}
+            <View style={[styles.planUsageCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+              <View style={styles.planUsageHeader}>
+                <View>
+                  <Text style={[styles.planUsageEyebrow, { color: theme.textSecondary }]}>USO DEL PLAN</Text>
+                  <Text style={[styles.planUsageTitle, { color: theme.text }]}>
+                    PS Inspect {plan === 'pro' ? 'Pro' : 'Free'}
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  style={[styles.upgradePlanButton, { backgroundColor: theme.primary }]}
+                  onPress={onOpenPlans}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.upgradePlanButtonText}>Mejorar plan</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* 3 Progress sub-boxes */}
+              <View style={styles.planMetricsRow}>
+                {/* Projects */}
+                <View style={[styles.planMetricBox, { backgroundColor: theme.isDark ? '#0e1826' : '#f8fafc', borderColor: theme.border }]}>
+                  <View style={styles.planMetricValueRow}>
+                    <Text style={[styles.planMetricCount, { color: theme.text }]}>
+                      {projects.length} de {limits.projects === Infinity ? '∞' : limits.projects}
+                    </Text>
+                    <Text style={[styles.planMetricName, { color: theme.textSecondary }]}>Proyectos</Text>
+                  </View>
+                  <View style={[styles.planProgressTrack, { backgroundColor: theme.isDark ? '#20334d' : '#e2e8f0' }]}>
+                    <View
+                      style={[
+                        styles.planProgressFill,
+                        {
+                          width: `${limits.projects === Infinity ? (projects.length > 0 ? 30 : 0) : Math.min((projects.length / limits.projects) * 100, 100)}%`,
+                          backgroundColor: '#f97316',
+                        },
+                      ]}
+                    />
+                  </View>
+                </View>
+
+                {/* Inspections */}
+                <View style={[styles.planMetricBox, { backgroundColor: theme.isDark ? '#0e1826' : '#f8fafc', borderColor: theme.border }]}>
+                  <View style={styles.planMetricValueRow}>
+                    <Text style={[styles.planMetricCount, { color: theme.text }]}>
+                      {inspections.length} de {limits.inspectionsPerProject === Infinity ? '∞' : limits.inspectionsPerProject}
+                    </Text>
+                    <Text style={[styles.planMetricName, { color: theme.textSecondary }]}>Inspecciones</Text>
+                  </View>
+                  <View style={[styles.planProgressTrack, { backgroundColor: theme.isDark ? '#20334d' : '#e2e8f0' }]}>
+                    <View
+                      style={[
+                        styles.planProgressFill,
+                        {
+                          width: `${limits.inspectionsPerProject === Infinity ? (inspections.length > 0 ? 30 : 0) : Math.min((inspections.length / limits.inspectionsPerProject) * 100, 100)}%`,
+                          backgroundColor: '#2563eb',
+                        },
+                      ]}
+                    />
+                  </View>
+                </View>
+
+                {/* Inspectors */}
+                <View style={[styles.planMetricBox, { backgroundColor: theme.isDark ? '#0e1826' : '#f8fafc', borderColor: theme.border }]}>
+                  <View style={styles.planMetricValueRow}>
+                    <Text style={[styles.planMetricCount, { color: theme.text }]}>
+                      1 de {limits.inspectors}
+                    </Text>
+                    <Text style={[styles.planMetricName, { color: theme.textSecondary }]}>Inspectores</Text>
+                  </View>
+                  <View style={[styles.planProgressTrack, { backgroundColor: theme.isDark ? '#20334d' : '#e2e8f0' }]}>
+                    <View
+                      style={[
+                        styles.planProgressFill,
+                        {
+                          width: `${Math.min((1 / limits.inspectors) * 100, 100)}%`,
+                          backgroundColor: '#f97316',
+                        },
+                      ]}
+                    />
+                  </View>
+                </View>
+              </View>
+
+              {/* Footer */}
+              <View style={styles.planUsageFooter}>
+                <Text style={[styles.planUsageFooterLeft, { color: theme.primary }]}>
+                  {limits.photosPerInspection} fotografía por inspección
+                </Text>
+                <Text style={[styles.planUsageFooterRight, { color: theme.textSecondary }]}>
+                  {plan === 'free' ? 'Has alcanzado 2 límites del plan Free' : 'Sin límites de almacenamiento'}
+                </Text>
+              </View>
+            </View>
+
+            {/* "Registros recientes" Section */}
+            <View style={styles.recentSectionHeaderRow}>
+              <Text style={[styles.recentSectionTitle, { color: theme.text }]}>Registros recientes</Text>
+              <TouchableOpacity onPress={() => setTab('projects')}>
+                <Text style={[styles.recentSectionLink, { color: theme.textSecondary }]}>Todos los proyectos</Text>
               </TouchableOpacity>
             </View>
 
-            {/* Search Box */}
-            <View style={[styles.searchBox, { backgroundColor: theme.card, borderColor: theme.border }]}>
-              <Feather name="search" size={16} color={theme.textSecondary} />
-              <TextInput
-                style={[styles.searchInput, { color: theme.text }]}
-                placeholder="Buscar por código, eje, nivel o patología..."
-                placeholderTextColor={theme.textMuted}
-                value={searchQuery}
-                onChangeText={setSearchQuery}
-              />
-              {searchQuery.length > 0 && (
+            {/* Search Box (Optional search within recent records) */}
+            {searchQuery.length > 0 && (
+              <View style={[styles.searchBox, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                <Feather name="search" size={16} color={theme.textSecondary} />
+                <TextInput
+                  style={[styles.searchInput, { color: theme.text }]}
+                  placeholder="Buscar elemento..."
+                  placeholderTextColor={theme.textMuted}
+                  value={searchQuery}
+                  onChangeText={setSearchQuery}
+                />
                 <TouchableOpacity onPress={() => setSearchQuery('')}>
                   <Feather name="x" size={16} color={theme.textSecondary} />
                 </TouchableOpacity>
-              )}
-            </View>
+              </View>
+            )}
 
-            {/* Filter Pills: Projects */}
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterPillsRow}>
-              <TouchableOpacity
-                style={[
-                  styles.filterPill,
-                  {
-                    backgroundColor: filterProject === 'all' ? theme.primary : theme.cardSecondary,
-                    borderColor: theme.border,
-                  },
-                ]}
-                onPress={() => setFilterProject('all')}
-              >
-                <Text style={[styles.filterPillText, { color: filterProject === 'all' ? '#fff' : theme.text }]}>
-                  Todos los Proyectos
-                </Text>
-              </TouchableOpacity>
-              {projects.map((p) => (
-                <TouchableOpacity
-                  key={`filter-p-${p.id}`}
-                  style={[
-                    styles.filterPill,
-                    {
-                      backgroundColor: filterProject === p.id ? theme.primary : theme.cardSecondary,
-                      borderColor: theme.border,
-                    },
-                  ]}
-                  onPress={() => setFilterProject(p.id)}
-                >
-                  <Text style={[styles.filterPillText, { color: filterProject === p.id ? '#fff' : theme.text }]}>
-                    {p.name}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-
-            {/* Filter Pills: Conditions (1-5) */}
-            <View style={styles.conditionFilterRow}>
-              <TouchableOpacity
-                style={[
-                  styles.condTagBtn,
-                  {
-                    backgroundColor: filterCondition === 'all' ? theme.text : theme.cardSecondary,
-                    borderColor: theme.border,
-                  },
-                ]}
-                onPress={() => setFilterCondition('all')}
-              >
-                <Text style={{ color: filterCondition === 'all' ? theme.bg : theme.text, fontSize: 11, fontWeight: '700' }}>
-                  Todas
-                </Text>
-              </TouchableOpacity>
-              {[1, 2, 3, 4, 5].map((c) => {
-                const isSel = filterCondition === c;
-                const cColor = getConditionColor(c, theme);
-                return (
-                  <TouchableOpacity
-                    key={`cond-btn-${c}`}
-                    style={[
-                      styles.condTagBtn,
-                      {
-                        backgroundColor: isSel ? cColor : theme.cardSecondary,
-                        borderColor: isSel ? cColor : theme.border,
-                      },
-                    ]}
-                    onPress={() => setFilterCondition(isSel ? 'all' : c)}
-                  >
-                    <Text style={{ color: isSel ? '#ffffff' : cColor, fontSize: 11, fontWeight: '800' }}>
-                      C{c}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-
-            {/* Inspections List */}
+            {/* Inspection Cards */}
             {filteredInspections.length === 0 ? (
               <View style={[styles.emptyListCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
                 <MaterialCommunityIcons name="clipboard-text-search-outline" size={44} color={theme.textMuted} />
                 <Text style={[styles.emptyListTitle, { color: theme.text }]}>No se encontraron registros</Text>
                 <Text style={[styles.emptyListSub, { color: theme.textSecondary }]}>
-                  Intenta cambiar los filtros o inicia una nueva inspección con el botón +
+                  Inicia una nueva inspección con el botón "+ Empezar"
                 </Text>
               </View>
             ) : (
               filteredInspections.map((insp, idx) => {
-                const condColor = getConditionColor(insp.condition, theme);
-                const condLabel = CONDITION_LABELS[insp.condition] || `Condición ${insp.condition}`;
-                const projName = projects.find((p) => p.id === insp.projectId)?.name || 'Obra General';
-                const dateStr = insp.createdAt ? new Date(insp.createdAt).toLocaleDateString('es-PE') : 'Reciente';
+                const iconConfig = getElementIconConfig(insp);
+                const badgeStyle = getConditionBadgeStyle(insp.condition);
+                const inspectorName = insp.user?.name || user?.name || 'Inspector';
 
                 return (
-                  <AnimatedCard key={`insp-card-${insp.id}-${idx}`} delay={idx * 30}>
+                  <AnimatedCard key={`insp-${insp.id}-${idx}`} delay={idx * 30}>
                     <TouchableOpacity
-                      style={[styles.inspectionCard, { backgroundColor: theme.card, borderColor: theme.border }]}
+                      style={[styles.recentInspCard, { backgroundColor: theme.card, borderColor: theme.border }]}
                       onPress={() => onSelectInspection(insp)}
-                      activeOpacity={0.85}
+                      activeOpacity={0.88}
                     >
-                      {/* Top Row: Code, Material Badge & Condition Badge */}
-                      <View style={styles.inspCardHeader}>
-                        <View style={styles.inspCodeCol}>
-                          <Text style={[styles.inspCode, { color: theme.text }]}>{insp.code}</Text>
-                          <Text style={[styles.inspType, { color: theme.textSecondary }]}>
-                            {insp.elementType || 'Elemento'} • {insp.material || 'Concreto'}
-                          </Text>
-                        </View>
-
-                        <View style={[styles.conditionPill, { backgroundColor: condColor }]}>
-                          <Text style={styles.conditionPillText}>C{insp.condition} {condLabel}</Text>
-                        </View>
+                      {/* Left Icon Square */}
+                      <View style={[styles.recentInspIconBox, { backgroundColor: iconConfig.boxBg }]}>
+                        <MaterialCommunityIcons name={iconConfig.iconName as any} size={22} color={iconConfig.iconColor} />
                       </View>
 
-                      {/* Location & Project */}
-                      <View style={styles.inspMetaRow}>
-                        <View style={styles.inspMetaItem}>
-                          <Feather name="map-pin" size={11} color={theme.textSecondary} />
-                          <Text style={[styles.inspMetaText, { color: theme.textSecondary }]}>
-                            Eje: {insp.axis || '-'} | {insp.level || '-'}
-                          </Text>
-                        </View>
-                        <View style={styles.inspMetaItem}>
-                          <Feather name="folder" size={11} color={theme.textSecondary} />
-                          <Text style={[styles.inspMetaText, { color: theme.textSecondary }]} numberOfLines={1}>
-                            {projName}
-                          </Text>
-                        </View>
+                      {/* Center Content */}
+                      <View style={styles.recentInspCenterCol}>
+                        <Text style={[styles.recentInspTitle, { color: theme.text }]} numberOfLines={1}>
+                          {insp.code} · {insp.elementType || 'Elemento estructural'}
+                        </Text>
+                        <Text style={[styles.recentInspSub, { color: theme.textSecondary }]} numberOfLines={1}>
+                          {insp.level || 'Nivel 01'} · {insp.axis || 'Eje A'} · {insp.condition} · {inspectorName}
+                        </Text>
                       </View>
 
-                      {/* Observations Preview */}
-                      {insp.observations ? (
-                        <View style={[styles.inspObsBox, { backgroundColor: theme.cardSecondary }]}>
-                          <Text style={[styles.inspObsText, { color: theme.text }]} numberOfLines={2}>
-                            {insp.observations}
-                          </Text>
-                        </View>
-                      ) : null}
-
-                      {/* Footer: Photos & Actions */}
-                      <View style={styles.inspCardFooter}>
-                        <View style={styles.inspPhotoCount}>
-                          <Feather name="camera" size={12} color={theme.textSecondary} />
-                          <Text style={[styles.inspPhotoCountText, { color: theme.textSecondary }]}>
-                            {insp.photos?.length || 0} foto{insp.photos?.length === 1 ? '' : 's'}
+                      {/* Right Actions & Badge */}
+                      <View style={styles.recentInspRightCol}>
+                        {/* Condition Pill */}
+                        <View style={[styles.condBadgePill, { backgroundColor: badgeStyle.bg, borderColor: badgeStyle.border }]}>
+                          <Text style={[styles.condBadgePillText, { color: badgeStyle.text }]}>
+                            {badgeStyle.label}
                           </Text>
                         </View>
 
-                        <View style={styles.inspActionsRow}>
-                          <TouchableOpacity
-                            style={[styles.cardActionBtn, { backgroundColor: theme.cardSecondary }]}
-                            onPress={() => {
-                              generateAndSharePDF({
-                                scope: 'inspection',
-                                inspections: [insp],
-                                user,
-                              });
-                            }}
-                          >
-                            <Feather name="file-text" size={13} color={theme.primary} />
-                          </TouchableOpacity>
-
-                          <TouchableOpacity
-                            style={[styles.cardActionBtn, { backgroundColor: theme.cardSecondary }]}
-                            onPress={() => onEditInspection(insp)}
-                          >
-                            <Feather name="edit-2" size={13} color={theme.text} />
-                          </TouchableOpacity>
-
-                          <TouchableOpacity
-                            style={[styles.cardActionBtn, { backgroundColor: theme.dangerLight }]}
-                            onPress={() => onDeleteInspection(insp)}
-                          >
-                            <Feather name="trash-2" size={13} color={theme.danger} />
-                          </TouchableOpacity>
-                        </View>
+                        {/* Edit Pill Button */}
+                        <TouchableOpacity
+                          style={[styles.editPillBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
+                          onPress={() => onEditInspection(insp)}
+                          activeOpacity={0.7}
+                        >
+                          <Feather name="edit-2" size={11} color={theme.text} />
+                          <Text style={[styles.editPillBtnText, { color: theme.text }]}>Editar</Text>
+                        </TouchableOpacity>
                       </View>
                     </TouchableOpacity>
                   </AnimatedCard>
@@ -1471,13 +1965,23 @@ function DashboardScreen({
                 <Text style={styles.sectionEyebrow}>PORTAFOLIO</Text>
                 <Text style={[styles.sectionTitle, { color: theme.text }]}>Proyectos y Obras</Text>
               </View>
-              <TouchableOpacity
-                style={[styles.quickAddBtn, { backgroundColor: theme.primary }]}
-                onPress={onOpenNewProject}
-              >
-                <Feather name="plus" size={14} color="#ffffff" />
-                <Text style={styles.quickAddBtnText}>Nuevo</Text>
-              </TouchableOpacity>
+              <View style={{ flexDirection: 'row', gap: 6 }}>
+                <TouchableOpacity
+                  style={[styles.quickAddBtn, { backgroundColor: theme.cardSecondary, borderColor: theme.border, borderWidth: 1 }]}
+                  onPress={onOpenJoinProject}
+                >
+                  <Feather name="link-2" size={13} color={theme.text} />
+                  <Text style={[styles.quickAddBtnText, { color: theme.text }]}>Unirse</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.quickAddBtn, { backgroundColor: theme.primary }]}
+                  onPress={onOpenNewProject}
+                >
+                  <Feather name="plus" size={14} color="#ffffff" />
+                  <Text style={styles.quickAddBtnText}>Nuevo</Text>
+                </TouchableOpacity>
+              </View>
             </View>
 
             {/* Usage Bar (Projects quota in Free plan) */}
@@ -1723,6 +2227,51 @@ function DashboardScreen({
                   </View>
                 );
               })()}
+            </View>
+
+            {/* Team & Collaboration */}
+            <View style={[styles.teamSectionCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+              <View style={styles.teamHeaderRow}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Feather name="users" size={16} color={theme.primary} />
+                  <Text style={[styles.teamTitle, { color: theme.text }]}>Inspectores en esta Obra</Text>
+                </View>
+                <View style={[styles.teamBadge, { backgroundColor: theme.cardSecondary }]}>
+                  <Text style={{ fontSize: 10, fontWeight: '700', color: theme.primary }}>
+                    {detailProject.members ? detailProject.members.length : 1} de {limits.inspectors === Infinity ? '∞' : limits.inspectors}
+                  </Text>
+                </View>
+              </View>
+
+              <Text style={[styles.teamSubText, { color: theme.textSecondary }]}>
+                Comparte este código con otros inspectores para sincronizar y levantar registros en esta obra juntos.
+              </Text>
+
+              <View style={styles.shareCodeRow}>
+                <View style={[styles.codeDisplayBox, { backgroundColor: theme.cardSecondary, borderColor: theme.border }]}>
+                  <Text style={[styles.codeDisplayText, { color: theme.text }]}>{detailProject.code}</Text>
+                </View>
+                <TouchableOpacity
+                  style={[styles.shareActionBtn, { backgroundColor: theme.primary }]}
+                  onPress={() => {
+                    Share.share({
+                      message: `🏗️ *PS Inspect - Obra Compartida*\n\nÚnete al equipo de inspección de *"${detailProject.name}"*.\n\n🔑 *Código de Obra:* ${detailProject.code}\n\nIngresa el código en tu app PS Inspect con el botón "Unirse" para colaborar.`,
+                      title: `Unirse a Obra: ${detailProject.name}`,
+                    });
+                  }}
+                >
+                  <Feather name="share-2" size={14} color="#ffffff" />
+                  <Text style={styles.shareActionBtnText}>Compartir</Text>
+                </TouchableOpacity>
+              </View>
+
+              <TouchableOpacity
+                style={[styles.inviteEmailBtn, { borderColor: theme.border, backgroundColor: theme.cardSecondary }]}
+                onPress={() => onOpenInviteInspector(detailProject)}
+              >
+                <Feather name="mail" size={13} color={theme.text} />
+                <Text style={[styles.inviteEmailBtnText, { color: theme.text }]}>Invitar por Correo Electrónico</Text>
+              </TouchableOpacity>
             </View>
 
             {/* List of inspections in this project */}
@@ -2005,18 +2554,25 @@ function DashboardScreen({
               />
             </View>
 
-            {/* Admin SOS Panel Shortcut */}
-            <TouchableOpacity
-              style={[styles.adminSosCard, { backgroundColor: '#dc2626' }]}
-              onPress={() => setTab('sos')}
-            >
-              <MaterialCommunityIcons name="alarm-light" size={24} color="#ffffff" />
-              <View style={{ flex: 1, marginLeft: 12 }}>
-                <Text style={styles.adminSosTitle}>Centro de Emergencias SOS</Text>
-                <Text style={styles.adminSosSub}>Monitoreo en tiempo real de coordenadas y alertas de campo.</Text>
-              </View>
-              <Feather name="chevron-right" size={20} color="#ffffff" />
-            </TouchableOpacity>
+            {/* Admin SOS Panel Shortcut - Only visible to Admins */}
+            {isAdmin && (
+              <TouchableOpacity
+                style={[styles.adminSosCard, { backgroundColor: '#dc2626' }]}
+                onPress={() => setTab('sos')}
+              >
+                <MaterialCommunityIcons name="alarm-light" size={24} color="#ffffff" />
+                <View style={{ flex: 1, marginLeft: 12 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <Text style={styles.adminSosTitle}>Centro de Emergencias SOS</Text>
+                    <View style={{ backgroundColor: '#ffffff25', paddingHorizontal: 6, paddingVertical: 1, borderRadius: 4 }}>
+                      <Text style={{ color: '#ffffff', fontSize: 9, fontWeight: '800' }}>ADMIN</Text>
+                    </View>
+                  </View>
+                  <Text style={styles.adminSosSub}>Monitoreo en tiempo real de coordenadas y alertas de campo.</Text>
+                </View>
+                <Feather name="chevron-right" size={20} color="#ffffff" />
+              </TouchableOpacity>
+            )}
           </View>
         )}
 
@@ -2044,104 +2600,126 @@ function DashboardScreen({
           styles.bottomNav,
           {
             paddingBottom: Math.max(insets.bottom, 10),
-            backgroundColor: theme.glassBg,
+            backgroundColor: theme.card,
             borderTopColor: theme.border,
           },
         ]}
       >
-        <NavTabButton
-          active={tab === 'records'}
-          icon="clipboard"
-          label="Registros"
+        {/* Tab 1: Registros */}
+        <TouchableOpacity
+          style={[
+            styles.navTabBtn,
+            tab === 'records' && styles.navTabBtnActivePill,
+          ]}
           onPress={() => setTab('records')}
-          theme={theme}
-        />
-        <NavTabButton
-          active={tab === 'projects' || tab === 'project-detail'}
-          icon="folder"
-          label="Proyectos"
-          onPress={() => setTab('projects')}
-          theme={theme}
-        />
+          activeOpacity={0.75}
+        >
+          <MaterialCommunityIcons
+            name="format-list-bulleted"
+            size={20}
+            color={tab === 'records' ? '#2563eb' : theme.textSecondary}
+          />
+          <Text
+            style={[
+              styles.navTabLabel,
+              {
+                color: tab === 'records' ? '#2563eb' : theme.textSecondary,
+                fontWeight: tab === 'records' ? '800' : '600',
+              },
+            ]}
+          >
+            Registros
+          </Text>
+        </TouchableOpacity>
 
-        {/* Central Inspect Button */}
+        {/* Tab 2: Proyectos */}
+        <TouchableOpacity
+          style={styles.navTabBtn}
+          onPress={() => setTab('projects')}
+          activeOpacity={0.75}
+        >
+          <MaterialCommunityIcons
+            name="office-building-outline"
+            size={20}
+            color={tab === 'projects' || tab === 'project-detail' ? '#2563eb' : theme.textSecondary}
+          />
+          <Text
+            style={[
+              styles.navTabLabel,
+              {
+                color: tab === 'projects' || tab === 'project-detail' ? '#2563eb' : theme.textSecondary,
+                fontWeight: tab === 'projects' || tab === 'project-detail' ? '800' : '600',
+              },
+            ]}
+          >
+            Proyectos
+          </Text>
+        </TouchableOpacity>
+
+        {/* Central Protruding Button: Inspeccionar */}
         <TouchableOpacity
           style={styles.centralNavFab}
           onPress={onStartInspection}
-          activeOpacity={0.85}
+          activeOpacity={0.88}
         >
           <LinearGradient
             colors={['#2563eb', '#1d4ed8']}
             style={styles.centralNavFabGrad}
           >
-            <Feather name="plus" size={24} color="#ffffff" />
+            <MaterialCommunityIcons name="camera" size={22} color="#ffffff" />
+            <Text style={styles.centralNavFabText}>Inspeccionar</Text>
           </LinearGradient>
         </TouchableOpacity>
 
-        <NavTabButton
-          active={tab === 'exports'}
-          icon="download"
-          label="Exportar"
+        {/* Tab 4: Exportar */}
+        <TouchableOpacity
+          style={styles.navTabBtn}
           onPress={() => setTab('exports')}
-          theme={theme}
-        />
-        <NavTabButton
-          active={tab === 'profile'}
-          icon="user"
-          label="Inspector"
-          onPress={() => setTab('profile')}
-          theme={theme}
-        />
-
-        {isAdmin && (
-          <NavTabButton
-            active={tab === 'sos'}
-            icon="alert-circle"
-            label="SOS"
-            onPress={() => setTab('sos')}
-            theme={theme}
-            iconColor="#dc2626"
+          activeOpacity={0.75}
+        >
+          <Feather
+            name="download"
+            size={18}
+            color={tab === 'exports' ? '#2563eb' : theme.textSecondary}
           />
-        )}
+          <Text
+            style={[
+              styles.navTabLabel,
+              {
+                color: tab === 'exports' ? '#2563eb' : theme.textSecondary,
+                fontWeight: tab === 'exports' ? '800' : '600',
+              },
+            ]}
+          >
+            Exportar
+          </Text>
+        </TouchableOpacity>
+
+        {/* Tab 5: Inspector */}
+        <TouchableOpacity
+          style={styles.navTabBtn}
+          onPress={() => setTab('profile')}
+          activeOpacity={0.75}
+        >
+          <Feather
+            name="user"
+            size={18}
+            color={tab === 'profile' || tab === 'sos' ? '#2563eb' : theme.textSecondary}
+          />
+          <Text
+            style={[
+              styles.navTabLabel,
+              {
+                color: tab === 'profile' || tab === 'sos' ? '#2563eb' : theme.textSecondary,
+                fontWeight: tab === 'profile' || tab === 'sos' ? '800' : '600',
+              },
+            ]}
+          >
+            Inspector
+          </Text>
+        </TouchableOpacity>
       </View>
     </View>
-  );
-}
-
-function NavTabButton({
-  active,
-  icon,
-  label,
-  onPress,
-  theme,
-  iconColor,
-}: {
-  active: boolean;
-  icon: any;
-  label: string;
-  onPress: () => void;
-  theme: ThemeType;
-  iconColor?: string;
-}) {
-  return (
-    <TouchableOpacity style={styles.navTabBtn} onPress={onPress} activeOpacity={0.75}>
-      <Feather
-        name={icon}
-        size={19}
-        color={active ? theme.primary : iconColor || theme.textSecondary}
-      />
-      <Text
-        style={[
-          styles.navTabLabel,
-          {
-            color: active ? theme.primary : iconColor || theme.textSecondary,
-            fontWeight: active ? '800' : '500',
-          },
-        ]}
-      >
-        {label}
-      </Text>
-    </TouchableOpacity>
   );
 }
 
@@ -2446,14 +3024,19 @@ function ProjectModal({
   const [location, setLocation] = useState(initialProject?.location || '');
   const [client, setClient] = useState(initialProject?.client || '');
   const [status, setStatus] = useState(initialProject?.status || 'En inspección');
+  const [errorName, setErrorName] = useState(false);
 
   const handleSave = () => {
-    if (!name.trim() || !code.trim()) return;
+    if (!name.trim()) {
+      setErrorName(true);
+      return;
+    }
+    const autoCode = `OB-${String(Date.now()).slice(-4)}`;
     onSave({
       name: name.trim(),
-      code: code.trim().toUpperCase(),
-      location: location.trim(),
-      client: client.trim(),
+      code: code.trim() ? code.trim().toUpperCase() : (initialProject?.code || autoCode),
+      location: location.trim() || 'Ubicación General',
+      client: client.trim() || 'General',
       status,
     });
   };
@@ -2484,21 +3067,47 @@ function ProjectModal({
           </View>
 
           <ScrollView style={{ maxHeight: 420 }} showsVerticalScrollIndicator={false}>
-            <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>NOMBRE DEL PROYECTO</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>
+                NOMBRE DEL PROYECTO <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>*</Text>
+              </Text>
+              <View style={{ backgroundColor: '#ef444415', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                <Text style={{ fontSize: 9, color: '#ef4444', fontWeight: '800' }}>OBLIGATORIO</Text>
+              </View>
+            </View>
             <TextInput
-              style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              style={[
+                styles.input,
+                {
+                  backgroundColor: theme.inputBg,
+                  borderColor: errorName && !name.trim() ? '#ef4444' : theme.border,
+                  borderWidth: errorName && !name.trim() ? 1.5 : 1,
+                  color: theme.text,
+                },
+              ]}
               placeholder="Ej. Edificio Residencial Los Sauces"
               placeholderTextColor={theme.textMuted}
               value={name}
-              onChangeText={setName}
+              onChangeText={(txt) => {
+                setName(txt);
+                if (errorName && txt.trim()) setErrorName(false);
+              }}
             />
+            {errorName && !name.trim() && (
+              <Text style={{ fontSize: 11, color: '#ef4444', marginTop: -4, marginBottom: 8, fontWeight: '600' }}>
+                ⚠️ El nombre del proyecto es obligatorio
+              </Text>
+            )}
 
             <View style={styles.formRow}>
               <View style={{ flex: 1 }}>
-                <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CÓDIGO (EJ. OB-04)</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>CÓDIGO</Text>
+                  <Text style={{ fontSize: 9, color: theme.textMuted, fontWeight: '600' }}>OPCIONAL</Text>
+                </View>
                 <TextInput
                   style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-                  placeholder="OB-04"
+                  placeholder="OB-04 (Auto)"
                   placeholderTextColor={theme.textMuted}
                   value={code}
                   onChangeText={setCode}
@@ -2506,7 +3115,10 @@ function ProjectModal({
                 />
               </View>
               <View style={{ flex: 1, marginLeft: 10 }}>
-                <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CLIENTE</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>CLIENTE</Text>
+                  <Text style={{ fontSize: 9, color: theme.textMuted, fontWeight: '600' }}>OPCIONAL</Text>
+                </View>
                 <TextInput
                   style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
                   placeholder="Inmobiliaria X"
@@ -2517,7 +3129,10 @@ function ProjectModal({
               </View>
             </View>
 
-            <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>UBICACIÓN</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>UBICACIÓN</Text>
+              <Text style={{ fontSize: 9, color: theme.textMuted, fontWeight: '600' }}>OPCIONAL</Text>
+            </View>
             <TextInput
               style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
               placeholder="Ej. San Isidro, Lima"
@@ -2526,7 +3141,7 @@ function ProjectModal({
               onChangeText={setLocation}
             />
 
-            <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>ESTADO</Text>
+            <Text style={[styles.inputLabel, { color: theme.textSecondary, marginTop: 4 }]}>ESTADO</Text>
             <View style={styles.conditionFilterRow}>
               {['En inspección', 'Pausado', 'Finalizado'].map((st) => (
                 <TouchableOpacity
@@ -2563,6 +3178,261 @@ function ProjectModal({
 }
 
 // ==========================================
+// JOIN PROJECT MODAL (UNIRSE A OBRA)
+// ==========================================
+function JoinProjectModal({
+  visible,
+  theme,
+  onClose,
+  onJoin,
+}: {
+  visible: boolean;
+  theme: ThemeType;
+  onClose: () => void;
+  onJoin: (code: string) => Promise<void>;
+}) {
+  const insets = useSafeAreaInsets();
+  const [code, setCode] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async () => {
+    if (!code.trim()) {
+      setError('Ingresa el código de la obra');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      await onJoin(code.trim());
+      setCode('');
+    } catch (e: any) {
+      setError(e?.message || 'No se pudo unir al proyecto');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+        <View
+          style={[
+            styles.modalContainer,
+            {
+              backgroundColor: theme.card,
+              borderColor: theme.border,
+              paddingBottom: Math.max(insets.bottom, 20),
+            },
+          ]}
+        >
+          <View style={styles.modalHeader}>
+            <View>
+              <Text style={styles.eyebrow}>TRABAJO COLABORATIVO</Text>
+              <Text style={[styles.title, { color: theme.text }]}>Unirse a una Obra</Text>
+            </View>
+            <TouchableOpacity onPress={onClose} style={[styles.closeBtn, { backgroundColor: theme.cardSecondary }]}>
+              <Feather name="x" size={18} color={theme.text} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={{ maxHeight: 360 }} showsVerticalScrollIndicator={false}>
+            <Text style={{ fontSize: 12, color: theme.textSecondary, marginBottom: 16, lineHeight: 18 }}>
+              Ingresa el código de la obra (ej. OB-04) para sincronizarla en tu dispositivo y registrar inspecciones en equipo.
+            </Text>
+
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>
+                CÓDIGO DE LA OBRA <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>*</Text>
+              </Text>
+              <View style={{ backgroundColor: '#ef444415', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                <Text style={{ fontSize: 9, color: '#ef4444', fontWeight: '800' }}>OBLIGATORIO</Text>
+              </View>
+            </View>
+
+            <TextInput
+              style={[
+                styles.input,
+                {
+                  backgroundColor: theme.inputBg,
+                  borderColor: error ? '#ef4444' : theme.border,
+                  borderWidth: error ? 1.5 : 1,
+                  color: theme.text,
+                  fontSize: 16,
+                  fontWeight: '700',
+                  letterSpacing: 1.5,
+                  textAlign: 'center',
+                },
+              ]}
+              placeholder="Ej. OB-04"
+              placeholderTextColor={theme.textMuted}
+              value={code}
+              onChangeText={(txt) => {
+                setCode(txt.toUpperCase());
+                if (error) setError('');
+              }}
+              autoCapitalize="characters"
+            />
+
+            {error ? (
+              <Text style={{ fontSize: 11, color: '#ef4444', marginTop: -4, marginBottom: 12, fontWeight: '600', textAlign: 'center' }}>
+                ⚠️ {error}
+              </Text>
+            ) : null}
+
+            <TouchableOpacity
+              style={[
+                styles.primaryButton,
+                { backgroundColor: theme.primary, marginTop: 12, opacity: loading ? 0.7 : 1 },
+              ]}
+              onPress={handleSubmit}
+              disabled={loading}
+            >
+              {loading ? (
+                <ActivityIndicator color="#ffffff" size="small" />
+              ) : (
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                  <Feather name="link-2" size={15} color="#ffffff" />
+                  <Text style={styles.primaryButtonText}>Vincularme a esta Obra</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+// ==========================================
+// INVITE INSPECTOR MODAL
+// ==========================================
+function InviteInspectorModal({
+  visible,
+  project,
+  theme,
+  onClose,
+  onInvite,
+}: {
+  visible: boolean;
+  project: Project | null;
+  theme: ThemeType;
+  onClose: () => void;
+  onInvite: (projectId: number, email: string) => Promise<void>;
+}) {
+  const insets = useSafeAreaInsets();
+  const [email, setEmail] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  if (!project) return null;
+
+  const handleSubmit = async () => {
+    if (!email.trim() || !email.includes('@')) {
+      setError('Ingresa un correo electrónico válido');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      await onInvite(project.id, email.trim());
+      setEmail('');
+    } catch (e: any) {
+      setError(e?.message || 'Error al invitar inspector');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+        <View
+          style={[
+            styles.modalContainer,
+            {
+              backgroundColor: theme.card,
+              borderColor: theme.border,
+              paddingBottom: Math.max(insets.bottom, 20),
+            },
+          ]}
+        >
+          <View style={styles.modalHeader}>
+            <View>
+              <Text style={styles.eyebrow}>EQUIPO DE INSPECCIÓN</Text>
+              <Text style={[styles.title, { color: theme.text }]}>Invitar Inspector</Text>
+            </View>
+            <TouchableOpacity onPress={onClose} style={[styles.closeBtn, { backgroundColor: theme.cardSecondary }]}>
+              <Feather name="x" size={18} color={theme.text} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView style={{ maxHeight: 360 }} showsVerticalScrollIndicator={false}>
+            <Text style={{ fontSize: 12, color: theme.textSecondary, marginBottom: 14, lineHeight: 18 }}>
+              Asigna a un inspector para colaborar en <Text style={{ fontWeight: '700', color: theme.text }}>"{project.name}"</Text> ({project.code}).
+            </Text>
+
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary, marginBottom: 0 }]}>
+                CORREO DEL INSPECTOR <Text style={{ color: '#ef4444', fontWeight: 'bold' }}>*</Text>
+              </Text>
+              <View style={{ backgroundColor: '#ef444415', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                <Text style={{ fontSize: 9, color: '#ef4444', fontWeight: '800' }}>OBLIGATORIO</Text>
+              </View>
+            </View>
+
+            <TextInput
+              style={[
+                styles.input,
+                {
+                  backgroundColor: theme.inputBg,
+                  borderColor: error ? '#ef4444' : theme.border,
+                  borderWidth: error ? 1.5 : 1,
+                  color: theme.text,
+                },
+              ]}
+              placeholder="inspector@vertexdev.tech"
+              placeholderTextColor={theme.textMuted}
+              value={email}
+              onChangeText={(txt) => {
+                setEmail(txt);
+                if (error) setError('');
+              }}
+              keyboardType="email-address"
+              autoCapitalize="none"
+            />
+
+            {error ? (
+              <Text style={{ fontSize: 11, color: '#ef4444', marginTop: -4, marginBottom: 12, fontWeight: '600' }}>
+                ⚠️ {error}
+              </Text>
+            ) : null}
+
+            <TouchableOpacity
+              style={[
+                styles.primaryButton,
+                { backgroundColor: theme.primary, marginTop: 12, opacity: loading ? 0.7 : 1 },
+              ]}
+              onPress={handleSubmit}
+              disabled={loading}
+            >
+              {loading ? (
+                <ActivityIndicator color="#ffffff" size="small" />
+              ) : (
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                  <Feather name="send" size={15} color="#ffffff" />
+                  <Text style={styles.primaryButtonText}>Enviar Invitación</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+// ==========================================
 // PROFILE EDIT MODAL
 // ==========================================
 function ProfileEditModal({
@@ -2588,6 +3458,30 @@ function ProfileEditModal({
   const [license, setLicense] = useState(user.license || '');
   const [password, setPassword] = useState('');
   const [saving, setSaving] = useState(false);
+  const [tsunamiEnabled, setTsunamiEnabled] = useState(true);
+
+  useEffect(() => {
+    AsyncStorage.getItem('@inspect_tsunami_visible').then((val) => {
+      if (val === 'false') {
+        setTsunamiEnabled(false);
+      } else {
+        setTsunamiEnabled(true);
+      }
+    });
+  }, []);
+
+  const handleToggleTsunami = async (val: boolean) => {
+    setTsunamiEnabled(val);
+    try {
+      await AsyncStorage.setItem('@inspect_tsunami_visible', val ? 'true' : 'false');
+      showToast(
+        val ? 'Mascota Tsunami reactivada en pantalla.' : 'Mascota Tsunami desactivada.',
+        'info'
+      );
+    } catch (e) {
+      console.warn('Error updating Tsunami preference:', e);
+    }
+  };
 
   const handleSave = async () => {
     if (!name.trim()) {
@@ -2674,8 +3568,44 @@ function ProfileEditModal({
               onChangeText={setPassword}
             />
 
+            {/* Mascot Tsunami Toggle */}
+            <View
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                backgroundColor: theme.cardSecondary,
+                borderColor: theme.border,
+                borderWidth: 1,
+                borderRadius: 12,
+                padding: 12,
+                marginTop: 14,
+                marginBottom: 4,
+              }}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1, paddingRight: 10 }}>
+                <TsunamiMascot pose="idle" size={36} />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontSize: 13, fontWeight: '700', color: theme.text, marginBottom: 2 }}>
+                    Mascota Tsunami
+                  </Text>
+                  <Text style={{ fontSize: 11, color: theme.textSecondary }}>
+                    {tsunamiEnabled
+                      ? 'Activa en pantalla con consejos técnicos y botón SOS'
+                      : 'Oculta (desactivada)'}
+                  </Text>
+                </View>
+              </View>
+              <Switch
+                value={tsunamiEnabled}
+                onValueChange={handleToggleTsunami}
+                trackColor={{ false: '#64748b', true: '#e07020' }}
+                thumbColor="#ffffff"
+              />
+            </View>
+
             <TouchableOpacity
-              style={[styles.primaryButton, { backgroundColor: theme.primary, marginTop: 20 }]}
+              style={[styles.primaryButton, { backgroundColor: theme.primary, marginTop: 14 }]}
               onPress={handleSave}
               disabled={saving}
             >
@@ -2784,56 +3714,397 @@ const styles = StyleSheet.create({
   topAppLeft: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 10,
   },
-  appLogoEmblem: {
-    width: 28,
-    height: 28,
-    borderRadius: 7,
+  psLogoBox: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: '#0f172a',
     alignItems: 'center',
     justifyContent: 'center',
+    position: 'relative',
   },
-  appLogoText: {
-    fontSize: 17,
-    fontWeight: '900',
-    color: '#2563eb',
-    letterSpacing: 0.5,
-  },
-  planBadgeHeader: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 6,
-  },
-  planBadgeText: {
-    fontSize: 9,
+  psLogoText: {
+    color: '#ffffff',
+    fontSize: 15,
     fontWeight: '900',
     letterSpacing: 0.5,
+  },
+  psLogoDot: {
+    position: 'absolute',
+    bottom: 5,
+    right: 5,
+    width: 5,
+    height: 5,
+    backgroundColor: '#f97316',
+    borderRadius: 1,
+  },
+  psAppTitle: {
+    fontSize: 15,
+    fontWeight: '900',
+    letterSpacing: -0.2,
+  },
+  psAppSubtitle: {
+    fontSize: 9.5,
+    fontWeight: '800',
+    color: '#059669',
+    letterSpacing: 0.6,
+    marginTop: 1,
   },
   topAppRight: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
   },
-  syncPendingBadge: {
+  planSwitchWrapper: {
+    flexDirection: 'row',
+    borderRadius: 20,
+    padding: 3,
+    alignItems: 'center',
+  },
+  planSwitchTab: {
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 16,
+  },
+  planSwitchTabActive: {
+    backgroundColor: '#2563eb',
+    shadowColor: '#2563eb',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  planSwitchText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  planSwitchTextActive: {
+    color: '#ffffff',
+    fontWeight: '900',
+  },
+  saveDiskBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  pendingDotIndicator: {
+    position: 'absolute',
+    top: 5,
+    right: 5,
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#2563eb',
+  },
+
+  // Active Project Top Selector Card
+  activeProjectBanner: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#2563eb',
-    paddingHorizontal: 7,
-    paddingVertical: 4,
-    borderRadius: 6,
+    borderWidth: 1,
+    borderRadius: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 14,
+  },
+  activeProjectIconBox: {
+    width: 42,
+    height: 42,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  activeProjectTextCol: {
+    flex: 1,
+    minWidth: 0,
+    marginLeft: 10,
+  },
+  activeProjectTitle: {
+    fontSize: 13.5,
+    fontWeight: '800',
+  },
+  activeProjectSub: {
+    fontSize: 11,
+    marginTop: 2,
+  },
+
+  // Field Activity Section Header
+  fieldActivityHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 12,
+  },
+  mainHeroTitle: {
+    fontSize: 22,
+    fontWeight: '900',
+    lineHeight: 26,
+    marginTop: 2,
+  },
+  sectionSubtitle: {
+    fontSize: 11.5,
+    marginTop: 3,
+  },
+  exportPillsGroup: {
+    flexDirection: 'row',
+    gap: 6,
+    alignItems: 'center',
+    paddingTop: 4,
+  },
+  exportBadgeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 18,
+    paddingVertical: 5,
+    paddingHorizontal: 8,
     gap: 4,
   },
-  syncPendingText: {
+  exportBadgeBtnText: {
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  proBadgePill: {
+    borderRadius: 4,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+  },
+  proBadgePillText: {
+    fontSize: 8,
+    fontWeight: '900',
+  },
+
+  // "Nueva inspección" Dark Navy Banner
+  newInspectionBanner: {
+    backgroundColor: '#0f172a',
+    borderRadius: 16,
+    padding: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  newInspectionTitle: {
     color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  newInspectionSub: {
+    color: '#94a3b8',
+    fontSize: 11,
+    marginTop: 3,
+  },
+  startPillBtn: {
+    backgroundColor: '#ffffff',
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  startPillBtnText: {
+    color: '#0f172a',
+    fontSize: 11.5,
+    fontWeight: '900',
+  },
+
+  // 3 Metric Stat Cards
+  statsRowThree: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 14,
+  },
+  statBoxCard: {
+    flex: 1,
+    minWidth: 0,
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    justifyContent: 'center',
+  },
+  statBigNum: {
+    fontSize: 20,
+    fontWeight: '900',
+  },
+  statBoxLabel: {
+    fontSize: 10,
+    fontWeight: '600',
+    marginTop: 4,
+    lineHeight: 13,
+  },
+
+  // "USO DEL PLAN" Card
+  planUsageCard: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 16,
+  },
+  planUsageHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  planUsageEyebrow: {
+    fontSize: 9.5,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+  },
+  planUsageTitle: {
+    fontSize: 15,
+    fontWeight: '900',
+    marginTop: 1,
+  },
+  upgradePlanButton: {
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  upgradePlanButtonText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  planMetricsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  planMetricBox: {
+    flex: 1,
+    minWidth: 0,
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 8,
+  },
+  planMetricValueRow: {
+    marginBottom: 6,
+  },
+  planMetricCount: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  planMetricName: {
+    fontSize: 9.5,
+    marginTop: 1,
+  },
+  planProgressTrack: {
+    height: 4,
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  planProgressFill: {
+    height: '100%',
+    borderRadius: 2,
+  },
+  planUsageFooter: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderTopWidth: 0.5,
+    borderTopColor: 'rgba(150,150,150,0.15)',
+    paddingTop: 10,
+  },
+  planUsageFooterLeft: {
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  planUsageFooterRight: {
+    fontSize: 9.5,
+    fontWeight: '500',
+  },
+
+  // "Registros recientes" Section
+  recentSectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  recentSectionTitle: {
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  recentSectionLink: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
+
+  // Recent Inspection Card List
+  recentInspCard: {
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 12,
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  recentInspIconBox: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  recentInspCenterCol: {
+    flex: 1,
+    minWidth: 0,
+    marginLeft: 10,
+    paddingRight: 6,
+  },
+  recentInspTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  recentInspSub: {
+    fontSize: 10.5,
+    marginTop: 2,
+  },
+  recentInspRightCol: {
+    alignItems: 'flex-end',
+    gap: 6,
+  },
+  condBadgePill: {
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 2.5,
+    alignItems: 'center',
+  },
+  condBadgePillText: {
     fontSize: 10,
     fontWeight: '800',
   },
-  iconButton: {
-    padding: 7,
-    borderRadius: 8,
+  editPillBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    gap: 3,
+  },
+  editPillBtnText: {
+    fontSize: 10,
+    fontWeight: '700',
   },
 
-  // Dashboard
+  // Dashboard Common
   dashboardContainer: {
     flex: 1,
   },
@@ -2864,7 +4135,7 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '900',
     color: '#2563eb',
-    letterSpacing: 1,
+    letterSpacing: 0.8,
   },
   sectionTitle: {
     fontSize: 18,
@@ -2889,7 +4160,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 10,
     paddingHorizontal: 12,
-    height: 40,
+    height: 38,
     marginBottom: 10,
     gap: 8,
   },
@@ -2922,83 +4193,6 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     borderRadius: 6,
     borderWidth: 1,
-  },
-
-  // Inspection Card
-  inspectionCard: {
-    borderWidth: 1,
-    borderRadius: 14,
-    padding: 12,
-    marginBottom: 10,
-  },
-  inspCardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    marginBottom: 6,
-  },
-  inspCodeCol: {
-    flex: 1,
-  },
-  inspCode: {
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  inspType: {
-    fontSize: 11,
-    marginTop: 1,
-  },
-  conditionPill: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 6,
-  },
-  conditionPillText: {
-    color: '#ffffff',
-    fontSize: 10,
-    fontWeight: '800',
-  },
-  inspMetaRow: {
-    flexDirection: 'row',
-    gap: 14,
-    marginBottom: 6,
-  },
-  inspMetaItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
-  inspMetaText: {
-    fontSize: 11,
-  },
-  inspObsBox: {
-    padding: 8,
-    borderRadius: 8,
-    marginBottom: 8,
-  },
-  inspObsText: {
-    fontSize: 11,
-    lineHeight: 15,
-  },
-  inspCardFooter: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    borderTopWidth: 0.5,
-    borderTopColor: 'rgba(150,150,150,0.15)',
-    paddingTop: 8,
-  },
-  inspPhotoCount: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-  },
-  inspPhotoCountText: {
-    fontSize: 11,
-  },
-  inspActionsRow: {
-    flexDirection: 'row',
-    gap: 6,
   },
   cardActionBtn: {
     padding: 6,
@@ -3418,35 +4612,54 @@ const styles = StyleSheet.create({
     justifyContent: 'space-around',
     alignItems: 'center',
     borderTopWidth: 1,
-    paddingTop: 8,
+    paddingTop: 6,
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.04,
+    shadowRadius: 6,
+    elevation: 8,
   },
   navTabBtn: {
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  navTabBtnActivePill: {
+    backgroundColor: '#eff6ff',
+    paddingHorizontal: 14,
   },
   navTabLabel: {
-    fontSize: 9,
-    marginTop: 3,
+    fontSize: 9.5,
+    marginTop: 2,
   },
   centralNavFab: {
-    marginTop: -24,
+    marginTop: -22,
     shadowColor: '#2563eb',
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.4,
+    shadowOpacity: 0.35,
     shadowRadius: 8,
-    elevation: 6,
+    elevation: 8,
   },
   centralNavFabGrad: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+    width: 60,
+    height: 60,
+    borderRadius: 30,
     alignItems: 'center',
     justifyContent: 'center',
+    borderWidth: 3,
+    borderColor: '#ffffff',
+  },
+  centralNavFabText: {
+    color: '#ffffff',
+    fontSize: 8,
+    fontWeight: '800',
+    marginTop: 1,
   },
 
   // Wizard
@@ -3882,6 +5095,20 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
+  guestButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingVertical: 10,
+    marginTop: 12,
+    gap: 6,
+  },
+  guestButtonText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
 
   // Image Preview
   imagePreviewOverlay: {
@@ -3972,5 +5199,81 @@ const styles = StyleSheet.create({
     fontSize: 11,
     textAlign: 'center',
     marginTop: 4,
+  },
+
+  // Team & Collaboration
+  teamSectionCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    padding: 16,
+    marginTop: 14,
+    marginBottom: 6,
+  },
+  teamHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  teamTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  teamBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  teamSubText: {
+    fontSize: 11,
+    lineHeight: 16,
+    marginBottom: 10,
+  },
+  shareCodeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+  },
+  codeDisplayBox: {
+    flex: 1,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  codeDisplayText: {
+    fontSize: 14,
+    fontWeight: '800',
+    letterSpacing: 1.5,
+  },
+  shareActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 8,
+  },
+  shareActionBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  inviteEmailBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 9,
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 2,
+  },
+  inviteEmailBtnText: {
+    fontSize: 11,
+    fontWeight: '600',
   },
 });

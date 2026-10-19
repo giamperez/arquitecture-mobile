@@ -164,7 +164,7 @@ export const SosAdminView: React.FC<SosAdminViewProps> = ({
           </Text>
           <Text style={[styles.emptySub, { color: theme.textSecondary }]}>
             La visualización consolidada de todas las alertas está reservada para la cuenta de
-            comando central (jeanpaulchilonsalazar@gmail.com).{'\n\n'}
+            comando central (contacto@vertexdev.tech).{'\n\n'}
             Puedes presionar el botón rojo arriba para emitir tu señal de emergencia en tiempo real.
           </Text>
         </View>
