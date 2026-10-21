@@ -1,9 +1,7 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import {
   StyleSheet,
-  Text,
   View,
-  TextInput,
   TouchableOpacity,
   Pressable,
   ScrollView,
@@ -19,7 +17,11 @@ import {
   useWindowDimensions,
   Linking,
   Share,
+  AppState,
 } from 'react-native';
+import { Text, TextInput } from './src/ui/ScaledText';
+import TextSizeControl from './src/components/TextSizeControl';
+import { API_BASE_URL } from './src/config';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ImagePicker from 'expo-image-picker';
@@ -37,27 +39,39 @@ import {
   OBSERVATIONS,
   CONDITION_LABELS,
   SEVERITY_LABELS,
+  materialKeyFromName,
+  parseObservations,
+  buildObservations,
 } from './src/data/observations';
 import { PLAN_LIMITS, type Plan } from './src/data/planLimits';
 import TsunamiMascot from './src/components/TsunamiMascot';
 import TsunamiWidget from './src/components/TsunamiWidget';
 import SosButton from './src/components/SosButton';
 import SosAdminView from './src/components/SosAdminView';
-import PlanModal from './src/components/PlanModal';
-import InspectionWizard from './src/components/InspectionWizard';
-import { generateAndSharePDF, generateAndShareExcel } from './src/utils/exportUtils';
-
-const API_BASE_URL = 'https://inspect.vertexdev.tech/api';
-
-const STORAGE_KEYS = {
-  TOKEN: '@inspect_auth_token',
-  USER: '@inspect_user_profile',
-  PROJECTS: '@inspect_cached_projects',
-  INSPECTIONS: '@inspect_cached_inspections',
-  PENDING_SYNC: '@inspect_pending_sync_queue',
-  THEME_DARK: '@inspect_theme_dark_mode',
-  PLAN: '@inspect_user_plan',
-};
+import InspectionWizard, { type WizardEditPayload } from './src/components/InspectionWizard';
+import { generateAndSharePDF, generateAndShareExcel, setPdfHooks } from './src/utils/exportUtils';
+import { runSync } from './src/utils/syncEngine';
+import {
+  STORAGE_KEYS,
+  isRealToken,
+  ownerFor,
+  setStorageOwner,
+  normalizeClientRequestId,
+  photoRequestId,
+  readJson,
+  readPendingProjects,
+  writePendingProjects,
+  adoptGuestData,
+  saveLastSession,
+  readLastSession,
+  clearLastSession,
+  type LastSession,
+  clearOwnerData,
+  getStorageOwner,
+  deleteLocalFiles,
+  isNetworkError,
+  isPermanentHttpError,
+} from './src/utils/offline';
 
 // --- TYPES ---
 interface User {
@@ -73,6 +87,7 @@ interface User {
 
 interface ProjectMember {
   id?: number;
+  specialty?: string;
   userId?: number;
   email?: string;
   name?: string;
@@ -88,6 +103,7 @@ interface Project {
   status: string;
   createdAt?: string;
   isLocalOnly?: boolean;
+  myRole?: string;
   members?: ProjectMember[];
   ownerId?: number;
 }
@@ -116,6 +132,7 @@ interface Inspection {
   createdAt?: string;
   photos?: Photo[];
   isPendingSync?: boolean;
+  clientRequestId?: string;
   project?: { id: number; name: string };
   user?: { id: number; name: string };
 }
@@ -256,6 +273,9 @@ async function savePhotoLocally(tempUri: string, type: string): Promise<string> 
 }
 
 // --- API HELPER ---
+// Igual que el interceptor 401 de la web: una sesión rechazada por el servidor se cierra (sin borrar lo pendiente).
+let unauthorizedHandler: (() => void) | null = null;
+
 async function apiRequest(
   path: string,
   options: RequestInit = {},
@@ -285,6 +305,7 @@ async function apiRequest(
       const err = new Error(data.message || `Error HTTP: ${res.status}`);
       (err as any).status = res.status;
       (err as any).data = data;
+      if (res.status === 401 && isRealToken(token)) unauthorizedHandler?.();
       throw err;
     }
     return data;
@@ -333,7 +354,8 @@ function MainApp() {
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
-  const [plan, setPlan] = useState<Plan>('free');
+  // Todos los usuarios tienen el plan Pro (no hay planes de pago ni funciones bloqueadas)
+  const plan = 'pro' as Plan;
   const [loading, setLoading] = useState(true);
   const [currentView, setCurrentView] = useState<'dashboard' | 'wizard'>('dashboard');
 
@@ -353,7 +375,6 @@ function MainApp() {
     message: '',
     onConfirm: () => {},
   });
-  const [showPlanModal, setShowPlanModal] = useState(false);
   const [selectedInspection, setSelectedInspection] = useState<Inspection | null>(null);
   const [editingInspection, setEditingInspection] = useState<Inspection | null>(null);
   const [showProjectModal, setShowProjectModal] = useState(false);
@@ -396,27 +417,26 @@ function MainApp() {
     }
   }, []);
 
-  // Save Plan
-  const handleSetPlan = async (newPlan: Plan) => {
-    setPlan(newPlan);
-    await AsyncStorage.setItem(STORAGE_KEYS.PLAN, newPlan);
-    showToast(`Plan actualizado a ${newPlan === 'pro' ? 'Pro 🚀' : 'Básico'}`, 'success');
-  };
-
   // Load Initial Storage Data
   useEffect(() => {
     const bootstrap = async () => {
       try {
-        const [savedToken, savedUser, savedProjects, savedInspections, savedQueue, savedTheme, savedPlan] =
-          await Promise.all([
-            AsyncStorage.getItem(STORAGE_KEYS.TOKEN),
-            AsyncStorage.getItem(STORAGE_KEYS.USER),
-            AsyncStorage.getItem(STORAGE_KEYS.PROJECTS),
-            AsyncStorage.getItem(STORAGE_KEYS.INSPECTIONS),
-            AsyncStorage.getItem(STORAGE_KEYS.PENDING_SYNC),
-            AsyncStorage.getItem(STORAGE_KEYS.THEME_DARK),
-            AsyncStorage.getItem(STORAGE_KEYS.PLAN),
-          ]);
+        const [savedToken, savedUser, savedTheme] = await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEYS.TOKEN),
+          AsyncStorage.getItem(STORAGE_KEYS.USER),
+          AsyncStorage.getItem(STORAGE_KEYS.THEME_DARK),
+        ]);
+
+        // Los datos en caché y pendientes se guardan por cuenta: primero se identifica a quién pertenecen.
+        const parsedUser: User | null = savedUser ? JSON.parse(savedUser) : null;
+        setStorageOwner(ownerFor(savedToken, parsedUser?.id));
+        const [savedProjects, savedInspections, savedQueue] = savedToken && parsedUser
+          ? await Promise.all([
+              AsyncStorage.getItem(STORAGE_KEYS.PROJECTS),
+              AsyncStorage.getItem(STORAGE_KEYS.INSPECTIONS),
+              AsyncStorage.getItem(STORAGE_KEYS.PENDING_SYNC),
+            ])
+          : [null, null, null];
 
         if (savedTheme !== null) {
           setIsDarkMode(savedTheme === 'true');
@@ -424,13 +444,10 @@ function MainApp() {
           setIsDarkMode(false);
         }
 
-        if (savedPlan) setPlan(savedPlan as Plan);
-        if (savedToken) setToken(savedToken);
-
-        if (savedUser) {
-          const u = JSON.parse(savedUser);
-          setUser(u);
-          if (u.plan) setPlan(u.plan as Plan);
+        // Sin usuario guardado no se puede saber a quién pertenece la sesión: se pide iniciar sesión de nuevo.
+        if (savedToken && parsedUser) {
+          setToken(savedToken);
+          setUser(parsedUser);
         }
 
         if (savedProjects && JSON.parse(savedProjects).length > 0) {
@@ -458,10 +475,10 @@ function MainApp() {
     bootstrap();
   }, []);
 
-  // Fetch Remote Data
+  // Fetch Remote Data (preserving local offline pending items)
   const fetchData = useCallback(
     async (authToken = token) => {
-      if (!authToken) return;
+      if (!authToken || authToken === 'offline-guest-token') return;
       const online = await checkNetworkStatus();
       if (!online) return;
 
@@ -473,25 +490,47 @@ function MainApp() {
         ]);
 
         if (projsRes.status === 'fulfilled' && Array.isArray(projsRes.value)) {
-          setProjects(projsRes.value);
-          AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(projsRes.value));
-          if (!activeProjectId && projsRes.value.length > 0) {
-            setActiveProjectId(projsRes.value[0].id);
+          const serverProjects: Project[] = projsRes.value;
+          // Las obras creadas sin conexión que aún no se subieron no existen en el servidor: se conservan.
+          const pendingProjectIds = new Set((await readPendingProjects()).map((p) => p.id));
+          setProjects((current) => {
+            const localOnly = current.filter((p) => p.isLocalOnly && pendingProjectIds.has(p.id));
+            const merged = [...localOnly, ...serverProjects];
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(merged));
+            return merged;
+          });
+          if (!activeProjectId && serverProjects.length > 0) {
+            setActiveProjectId(serverProjects[0].id);
           }
         }
 
         if (inspsRes.status === 'fulfilled' && Array.isArray(inspsRes.value)) {
-          setInspections(inspsRes.value);
-          AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(inspsRes.value));
+          const serverInspections = inspsRes.value;
+          setInspections((current) => {
+            // Keep pending local items that haven't been synchronized yet
+            const pendingItems = current.filter(
+              (i) => i.isPendingSync || String(i.id).startsWith('local_')
+            );
+            // Only drop a pending item if it's already present in serverInspections
+            // (el servidor devuelve clientRequestId como "<userId>:<id>")
+            const stillPending = pendingItems.filter(
+              (p) =>
+                !serverInspections.some(
+                  (s: any) =>
+                    s.clientRequestId &&
+                    normalizeClientRequestId(s.clientRequestId) ===
+                      normalizeClientRequestId(p.clientRequestId || String(p.id))
+                )
+            );
+            const merged = [...stillPending, ...serverInspections];
+            AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(merged));
+            return merged;
+          });
         }
 
         if (meRes.status === 'fulfilled' && meRes.value) {
           setUser(meRes.value);
           AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(meRes.value));
-          if (meRes.value.plan) {
-            setPlan(meRes.value.plan as Plan);
-            AsyncStorage.setItem(STORAGE_KEYS.PLAN, meRes.value.plan);
-          }
         }
       } catch (e) {
         console.warn('Error fetching data:', e);
@@ -505,97 +544,288 @@ function MainApp() {
   }, [token, fetchData]);
 
   // Offline Sync Queue Worker
-  const syncOfflineQueue = useCallback(async () => {
-    if (isSyncing || pendingSyncList.length === 0) return;
-    const online = await checkNetworkStatus();
-    if (!online) {
-      showToast('Sin conexión para sincronizar.', 'info');
-      return;
-    }
+  const syncingRef = useRef(false);
+  const pendingRef = useRef<PendingSyncItem[]>([]);
+  // Ids reales del servidor de lo que se subió desde el dispositivo (para pedir el PDF de un registro/obra recién sincronizado).
+  const serverInspectionIds = useRef(new Map<string, number>());
+  const serverProjectIds = useRef(new Map<number, number>());
+  useEffect(() => {
+    pendingRef.current = pendingSyncList;
+  }, [pendingSyncList]);
 
-    setIsSyncing(true);
-    showToast('Sincronizando inspecciones pendientes...', 'info');
+  // Único punto que modifica la cola: la guarda en el dispositivo en el mismo paso, así un registro nuevo
+  // creado mientras se sincroniza no se pierde.
+  const updateQueue = useCallback((fn: (prev: PendingSyncItem[]) => PendingSyncItem[]) => {
+    const next = fn(pendingRef.current);
+    pendingRef.current = next;
+    setPendingSyncList(next);
+    AsyncStorage.setItem(STORAGE_KEYS.PENDING_SYNC, JSON.stringify(next));
+  }, []);
 
-    const remainingQueue: PendingSyncItem[] = [];
-
-    for (const item of pendingSyncList) {
-      try {
-        const created = await apiRequest('/inspections', {
-          method: 'POST',
-          body: JSON.stringify(item.data),
-        }, token);
-
-        // Upload photos for this inspection
-        if (item.localPhotos && item.localPhotos.length > 0 && created.id) {
-          for (const photo of item.localPhotos) {
-            try {
-              const formData = new FormData();
-              const filename = photo.uri.split('/').pop() || 'photo.jpg';
-              formData.append('file', {
-                uri: photo.uri,
-                name: filename,
-                type: 'image/jpeg',
-              } as any);
-
-              await apiRequest(
-                `/photos/upload/${created.id}?photoType=${photo.type || 'general'}`,
-                { method: 'POST', body: formData },
-                token,
-                30000
-              );
-            } catch (pErr) {
-              console.warn('Error uploading photo:', pErr);
-            }
-          }
-        }
-      } catch (err) {
-        console.warn('Error syncing item:', item.id, err);
-        remainingQueue.push(item);
+  const syncOfflineQueue = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const silent = opts?.silent === true;
+      if (syncingRef.current) return;
+      if (!isRealToken(token)) {
+        if (!silent) showToast('Inicia sesión con tu cuenta para sincronizar con la nube.', 'info');
+        return;
       }
-    }
 
-    setPendingSyncList(remainingQueue);
-    await AsyncStorage.setItem(STORAGE_KEYS.PENDING_SYNC, JSON.stringify(remainingQueue));
-    setIsSyncing(false);
+      const pendingProjects = await readPendingProjects();
+      if (pendingRef.current.length === 0 && pendingProjects.length === 0) {
+        if (!silent) showToast('Todo está sincronizado.', 'success');
+        return;
+      }
+      const online = await checkNetworkStatus();
+      if (!online) {
+        if (!silent) showToast('Sin conexión para sincronizar.', 'info');
+        return;
+      }
 
-    if (remainingQueue.length === 0) {
-      showToast('¡Sincronización completada con éxito!', 'success');
-      setCelebrationTrigger(true);
-    } else {
-      showToast(`Quedan ${remainingQueue.length} elementos pendientes.`, 'error');
-    }
+      syncingRef.current = true;
+      setIsSyncing(true);
+      if (!silent) showToast('Sincronizando registros pendientes con el servidor...', 'info');
 
-    fetchData(token);
-  }, [isSyncing, pendingSyncList, token, checkNetworkStatus, fetchData, showToast]);
+      let authLost = false;
+      let syncedCount = 0;
+      let remainingProjects: any[] = pendingProjects;
+      try {
+        const result = await runSync([...pendingRef.current], pendingProjects, {
+          api: (path, options, timeoutMs) => apiRequest(path, options as RequestInit, token, timeoutMs),
+          buildPhotoBody: (photo) => {
+            const formData = new FormData();
+            formData.append('file', {
+              uri: photo.uri,
+              name: photo.uri.split('/').pop() || `media_${Date.now()}`,
+              type: photo.type === 'audio' ? 'audio/mp4' : 'image/jpeg',
+            } as any);
+            return formData;
+          },
+        });
+        authLost = result.authLost;
+        syncedCount = result.syncedCount;
+        remainingProjects = result.remainingProjects;
+
+        // Ids reales del servidor (para pedir el PDF de lo recién sincronizado)
+        result.serverInspectionIds.forEach((id, rid) => serverInspectionIds.current.set(rid, id));
+        Object.entries(result.projectIdMap).forEach(([localId, serverId]) =>
+          serverProjectIds.current.set(Number(localId), serverId)
+        );
+
+        await writePendingProjects(remainingProjects);
+        deleteLocalFiles(result.filesToDelete);
+
+        const { projectIdMap, createdProjects } = result;
+        if (Object.keys(projectIdMap).length > 0) {
+          setProjects((prev) => {
+            const next = prev.map((p) => createdProjects[p.id] ?? p);
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(next));
+            return next;
+          });
+          setInspections((prev) => {
+            const next = prev.map((i) => (projectIdMap[i.projectId] ? { ...i, projectId: projectIdMap[i.projectId] } : i));
+            AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(next));
+            return next;
+          });
+          setActiveProjectId((cur) => (cur != null && projectIdMap[cur] ? projectIdMap[cur] : cur));
+        }
+
+        updateQueue((prev) =>
+          prev
+            .filter((p) => !result.synced.has(p.id))
+            .map((p) => (result.patches.has(p.id) ? { ...p, ...result.patches.get(p.id) } : p))
+        );
+
+        if (result.replacements.size > 0) {
+          setInspections((prev) => {
+            const next = prev.map((i) => {
+              const rid = i.clientRequestId ? normalizeClientRequestId(i.clientRequestId) : normalizeClientRequestId(String(i.id));
+              return result.replacements.get(rid) ?? i;
+            });
+            AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(next));
+            return next;
+          });
+        }
+
+        if (result.droppedMedia > 0) {
+          showToast(`${result.droppedMedia} archivo(s) fueron rechazados por el servidor (formato o límite) y se descartaron.`, 'error');
+        }
+      } finally {
+        syncingRef.current = false;
+        setIsSyncing(false);
+      }
+
+      if (authLost) return;
+
+      const remaining = pendingRef.current.length + remainingProjects.length;
+      if (remaining === 0) {
+        if (syncedCount > 0 || !silent) {
+          showToast('¡Sincronización completada con éxito!', 'success');
+          if (syncedCount > 0) setCelebrationTrigger(true);
+        }
+      } else if (!silent || syncedCount > 0) {
+        showToast(`Quedan ${remaining} elementos pendientes en este dispositivo.`, 'info');
+      }
+
+      fetchData(token);
+    },
+    [token, checkNetworkStatus, fetchData, showToast, updateQueue]
+  );
+
+  // Reconexión automática: al abrir la app, al volver a primer plano y cada 15 s se comprueba la red;
+  // al recuperarla se refrescan los datos y se envía lo pendiente.
+  const syncRef = useRef(syncOfflineQueue);
+  syncRef.current = syncOfflineQueue;
+  const fetchRef = useRef(fetchData);
+  fetchRef.current = fetchData;
+  const wasOnlineRef = useRef(true);
+
+  useEffect(() => {
+    if (!isRealToken(token)) return;
+    let cancelled = false;
+    const tick = async () => {
+      const online = await checkNetworkStatus();
+      const reconnected = online && !wasOnlineRef.current;
+      wasOnlineRef.current = online;
+      if (!online || cancelled) return;
+      if (reconnected) await fetchRef.current(token);
+      await syncRef.current({ silent: true });
+    };
+    tick();
+    const interval = setInterval(tick, 15000);
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') tick();
+    });
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      sub.remove();
+    };
+  }, [token, checkNetworkStatus]);
+
+  // El PDF se descarga siempre de la API (GET /reports/pdf): antes se sube lo pendiente y se resuelven los ids reales.
+  useEffect(() => {
+    setPdfHooks({
+      notify: showToast,
+      prepare: async ({ scope, project, inspections: insps }) => {
+        if (!isRealToken(token) || !(await checkNetworkStatus())) return null;
+
+        if (pendingRef.current.length > 0 || (await readPendingProjects()).length > 0) {
+          showToast('Sincronizando registros pendientes antes de generar el PDF...', 'info');
+          await syncRef.current({ silent: true });
+        }
+
+        if (scope === 'project') {
+          const pid = Number(project?.id);
+          const serverPid = serverProjectIds.current.get(pid);
+          if (!serverPid && project?.isLocalOnly) {
+            showToast('Esta obra aún no se pudo sincronizar con el servidor, por eso todavía no se puede generar su PDF.', 'info');
+            return null;
+          }
+          return { projectId: serverPid ?? pid };
+        }
+        if (scope === 'inspection') {
+          const insp = insps[0];
+          const numeric = Number(insp?.id);
+          if (Number.isInteger(numeric) && !String(insp?.id).startsWith('local_')) return { inspectionId: numeric };
+          const rid = normalizeClientRequestId(insp?.clientRequestId || String(insp?.id));
+          const serverId = serverInspectionIds.current.get(rid);
+          if (serverId) return { inspectionId: serverId };
+          showToast('Esta inspección aún no se pudo sincronizar con el servidor, por eso todavía no se puede generar su PDF.', 'info');
+          return null;
+        }
+        return {};
+      },
+    });
+    return () => setPdfHooks({});
+  }, [token, checkNetworkStatus, showToast]);
 
   // Auth Functions
   const handleLoginSuccess = async (newToken: string, loggedUser: User) => {
+    const owner = ownerFor(newToken, loggedUser.id);
+    setStorageOwner(owner);
+    if (owner && isRealToken(newToken)) await adoptGuestData(owner);
+
+    // Lo que esta cuenta dejó guardado en el dispositivo (caché y cola pendiente) vuelve a estar disponible.
+    const [cachedProjects, cachedInspections, queue] = await Promise.all([
+      readJson<Project[]>(STORAGE_KEYS.PROJECTS, []),
+      readJson<Inspection[]>(STORAGE_KEYS.INSPECTIONS, []),
+      readJson<PendingSyncItem[]>(STORAGE_KEYS.PENDING_SYNC, []),
+    ]);
+    setProjects(cachedProjects);
+    setInspections(cachedInspections);
+    setPendingSyncList(queue);
+    setActiveProjectId(cachedProjects[0]?.id ?? null);
+
     setToken(newToken);
     setUser(loggedUser);
-    if (loggedUser.plan) setPlan(loggedUser.plan as Plan);
     await AsyncStorage.setItem(STORAGE_KEYS.TOKEN, newToken);
     await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(loggedUser));
+    if (isRealToken(newToken)) await saveLastSession({ token: newToken, user: loggedUser });
     showToast(`Bienvenido, ${loggedUser.name}`, 'success');
     fetchData(newToken);
   };
+
+  // Cierra la sesión pero conserva en el dispositivo lo pendiente de esa cuenta (se sincroniza al volver a entrar).
+  const closeSession = useCallback(async () => {
+    setToken(null);
+    setUser(null);
+    setProjects([]);
+    setInspections([]);
+    setPendingSyncList([]);
+    setActiveProjectId(null);
+    setStorageOwner(null);
+    await AsyncStorage.multiRemove([STORAGE_KEYS.TOKEN, STORAGE_KEYS.USER]);
+  }, []);
+
+  useEffect(() => {
+    unauthorizedHandler = () => {
+      clearLastSession();
+      closeSession().then(() => showToast('Tu sesión expiró. Inicia sesión de nuevo; tus registros pendientes siguen guardados.', 'info'));
+    };
+    return () => {
+      unauthorizedHandler = null;
+    };
+  }, [closeSession, showToast]);
 
   const handleLogout = () => {
     setDialog({
       visible: true,
       title: 'Cerrar sesión',
-      message: '¿Estás seguro de que deseas salir de tu cuenta?',
+      message:
+        pendingSyncList.length > 0
+          ? `Tienes ${pendingSyncList.length} registro(s) sin sincronizar. Seguirán guardados en este dispositivo y se enviarán cuando vuelvas a entrar con esta cuenta. ¿Cerrar sesión?`
+          : '¿Estás seguro de que deseas salir de tu cuenta?',
       confirmText: 'Cerrar Sesión',
       destructive: true,
       onConfirm: async () => {
         setDialog((d) => ({ ...d, visible: false }));
-        setToken(null);
-        setUser(null);
-        setProjects([]);
-        setInspections([]);
-        await AsyncStorage.multiRemove([STORAGE_KEYS.TOKEN, STORAGE_KEYS.USER]);
+        await closeSession();
         showToast('Sesión cerrada.', 'info');
       },
     });
+  };
+
+  const handleDeleteAccount = async (password: string) => {
+    if (token && token !== 'offline-guest-token') {
+      await apiRequest(
+        '/auth/me',
+        { method: 'DELETE', body: JSON.stringify(password ? { password } : {}) },
+        token,
+      );
+    }
+    setToken(null);
+    setUser(null);
+    setProjects([]);
+    setInspections([]);
+    setPendingSyncList([]);
+    setActiveProjectId(null);
+    const owner = getStorageOwner();
+    if (owner) await clearOwnerData(owner);
+    setStorageOwner(null);
+    await clearLastSession();
+    await AsyncStorage.multiRemove([STORAGE_KEYS.TOKEN, STORAGE_KEYS.USER, STORAGE_KEYS.PLAN]);
+    showToast('Cuenta eliminada con éxito.', 'info');
   };
 
   // Switch View Tab Helper
@@ -605,32 +835,100 @@ function MainApp() {
   };
 
   // Open Project Detail
-  const openProjectDetail = (proj: Project) => {
+  const openProjectDetail = async (proj: Project) => {
     setDetailProject(proj);
     setTab('project-detail');
+
+    if (token && token !== 'offline-guest-token') {
+      try {
+        let members: any[] = [];
+        try {
+          const res = await apiRequest(`/projects/${proj.id}/members`, {}, token);
+          if (Array.isArray(res)) members = res.map((m: any) => m.user || m);
+        } catch {
+          const res2 = await apiRequest(`/invite/members/${proj.id}`, {}, token);
+          if (Array.isArray(res2)) members = res2.map((m: any) => m.user || m);
+        }
+        if (members.length > 0) {
+          setDetailProject((prev) => (prev && prev.id === proj.id ? { ...prev, members } : prev));
+          setProjects((prev) => {
+            const updated = prev.map((p) => (p.id === proj.id ? { ...p, members } : p));
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(updated));
+            return updated;
+          });
+        }
+      } catch (err) {
+        console.warn('Error fetching project members:', err);
+      }
+    }
   };
 
   // Save Project
   const handleSaveProject = async (formData: { name: string; code: string; location: string; client: string; status: string }) => {
     try {
+      const isOffline = !token || token === 'offline-guest-token' || !isOnline;
+
+      if (isOffline) {
+        if (editingProject && !editingProject.isLocalOnly && isRealToken(token)) {
+          showToast('Necesitas conexión para editar una obra que ya está en el servidor.', 'info');
+          return;
+        }
+        if (editingProject) {
+          const updated = { ...editingProject, ...formData };
+          setProjects((prev) => {
+            const list = prev.map((p) => (p.id === editingProject.id ? updated : p));
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(list));
+            return list;
+          });
+          if (editingProject.isLocalOnly) {
+            const pending = await readPendingProjects();
+            await writePendingProjects(pending.map((p) => (p.id === editingProject.id ? { ...p, ...formData } : p)));
+          }
+          showToast('Proyecto actualizado localmente (offline)', 'success');
+        } else {
+          const newProj: Project = {
+            id: Date.now(),
+            ...formData,
+            code: formData.code || `OB-${String(projects.length + 1).padStart(2, '0')}`,
+            isLocalOnly: true,
+            createdAt: new Date().toISOString(),
+          };
+          setProjects((prev) => {
+            const list = [...prev, newProj];
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(list));
+            return list;
+          });
+          // Save in pending projects queue
+          const pendingProjects = await readPendingProjects();
+          await writePendingProjects([...pendingProjects, newProj]);
+          showToast('Proyecto guardado en modo offline', 'success');
+        }
+        setShowProjectModal(false);
+        setEditingProject(null);
+        return;
+      }
+
       if (editingProject) {
         const updated = await apiRequest(`/projects/${editingProject.id}`, {
           method: 'PATCH',
           body: JSON.stringify(formData),
         }, token);
-        setProjects((prev) => prev.map((p) => (p.id === editingProject.id ? { ...p, ...formData } : p)));
+        setProjects((prev) => {
+          const list = prev.map((p) => (p.id === editingProject.id ? { ...p, ...formData } : p));
+          AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(list));
+          return list;
+        });
         showToast('Proyecto actualizado', 'success');
       } else {
-        if (plan === 'free' && projects.length >= limits.projects) {
-          setShowPlanModal(true);
-          showToast('Has alcanzado el límite de 3 proyectos del plan Básico.', 'info');
-          return;
-        }
         const created = await apiRequest('/projects', {
           method: 'POST',
           body: JSON.stringify(formData),
         }, token);
-        setProjects((prev) => [...prev, created]);
+        setProjects((prev) => {
+          const list = [...prev, created];
+          AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(list));
+          return list;
+        });
         showToast('Proyecto creado con éxito', 'success');
       }
       setShowProjectModal(false);
@@ -649,22 +947,41 @@ function MainApp() {
     }
 
     try {
-      const res = await apiRequest('/projects/join', {
-        method: 'POST',
-        body: JSON.stringify({ code: cleanCode }),
-      }, token);
+      let res: any = null;
+      try {
+        res = await apiRequest('/projects/join', {
+          method: 'POST',
+          body: JSON.stringify({ code: cleanCode }),
+        }, token);
+      } catch (e: any) {
+        // Fallback to /invite/join (same as web)
+        try {
+          const inviteRes = await apiRequest('/invite/join', {
+            method: 'POST',
+            body: JSON.stringify({ code: cleanCode }),
+          }, token);
+          res = inviteRes.project || inviteRes;
+          if (inviteRes.message) showToast(inviteRes.message, 'success');
+        } catch {
+          throw e;
+        }
+      }
 
       if (res && res.id) {
         setProjects((prev) => {
           const exists = prev.some((p) => p.id === res.id);
-          return exists ? prev.map((p) => (p.id === res.id ? res : p)) : [...prev, res];
+          const updated = exists ? prev.map((p) => (p.id === res.id ? res : p)) : [...prev, res];
+          AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(updated));
+          return updated;
         });
         showToast(`¡Te has unido a "${res.name}" exitosamente!`, 'success');
 
         if (res.inspections && Array.isArray(res.inspections)) {
           setInspections((prev) => {
             const others = prev.filter((i) => i.projectId !== res.id);
-            return [...others, ...res.inspections];
+            const updated = [...others, ...res.inspections];
+            AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(updated));
+            return updated;
           });
         }
         setShowJoinProjectModal(false);
@@ -702,6 +1019,39 @@ function MainApp() {
     }
   };
 
+  // Remove a member (DELETE /projects/:id/members/:userId, igual que la web)
+  const handleRemoveMember = (proj: Project, member: ProjectMember) => {
+    const memberId = member.id ?? member.userId;
+    if (memberId == null) return;
+    setDialog({
+      visible: true,
+      title: 'Remover inspector',
+      message: `¿Remover a ${member.name || member.email || 'este inspector'} de "${proj.name}"?`,
+      confirmText: 'Remover',
+      destructive: true,
+      onConfirm: async () => {
+        setDialog((d) => ({ ...d, visible: false }));
+        try {
+          await apiRequest(`/projects/${proj.id}/members/${memberId}`, { method: 'DELETE' }, token);
+          const dropMember = (p: Project) =>
+            p.id === proj.id ? { ...p, members: (p.members || []).filter((m) => (m.id ?? m.userId) !== memberId) } : p;
+          setDetailProject((prev) => (prev ? dropMember(prev) : prev));
+          setProjects((prev) => {
+            const updated = prev.map(dropMember);
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(updated));
+            return updated;
+          });
+          showToast('Inspector removido de la obra', 'info');
+        } catch (e: any) {
+          showToast(
+            isNetworkError(e) ? 'Sin conexión: no se pudo remover al inspector.' : e?.message || 'Error al remover miembro',
+            isNetworkError(e) ? 'info' : 'error'
+          );
+        }
+      },
+    });
+  };
+
   // Delete Project
   const handleDeleteProject = (proj: Project) => {
     setDialog({
@@ -713,8 +1063,17 @@ function MainApp() {
       onConfirm: async () => {
         setDialog((d) => ({ ...d, visible: false }));
         try {
-          await apiRequest(`/projects/${proj.id}`, { method: 'DELETE' }, token);
-          setProjects((prev) => prev.filter((p) => p.id !== proj.id));
+          const isLocal = proj.isLocalOnly || !token || token === 'offline-guest-token';
+          if (!isLocal) {
+            await apiRequest(`/projects/${proj.id}`, { method: 'DELETE' }, token);
+          }
+          setProjects((prev) => {
+            const updated = prev.filter((p) => p.id !== proj.id);
+            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(updated));
+            return updated;
+          });
+          // Also clean up pending projects queue
+          await writePendingProjects((await readPendingProjects()).filter((p) => p.id !== proj.id));
           if (tab === 'project-detail') setTab('projects');
           showToast('Proyecto eliminado', 'success');
         } catch {
@@ -724,23 +1083,106 @@ function MainApp() {
     });
   };
 
-  // Save / Update Inspection
-  const handleSaveInspectionEdit = async (id: number | string, updatedData: Partial<Inspection>) => {
-    try {
-      await apiRequest(`/inspections/${id}`, {
-        method: 'PATCH',
-        body: JSON.stringify(updatedData),
-      }, token);
-      setInspections((prev) =>
-        prev.map((i) => (i.id === id ? { ...i, ...updatedData } : i))
+  // Edit an inspection (desde el mismo wizard de 3 pasos)
+  const openEditInspection = (insp: Inspection) => {
+    setSelectedInspection(null);
+    setEditingInspection(insp);
+    setCurrentView('wizard');
+  };
+
+  const handleWizardUpdate = async (insp: Inspection, p: WizardEditPayload): Promise<boolean> => {
+    const syncSelected = (updated: Inspection) => {
+      if (selectedInspection?.id === insp.id) setSelectedInspection(updated);
+    };
+    const storeInspection = (updated: Inspection) => {
+      setInspections((prev) => {
+        const list = prev.map((i) => (i.id === insp.id ? updated : i));
+        AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(list));
+        return list;
+      });
+      syncSelected(updated);
+    };
+
+    // Registro que todavía no existe en el servidor: se edita en el dispositivo, con sus fotos pendientes.
+    if (String(insp.id).startsWith('local_')) {
+      updateQueue((prev) =>
+        prev.map((q) =>
+          `local_${q.id}` === String(insp.id)
+            ? { ...q, data: { ...q.data, ...p.data }, localPhotos: p.localPhotos ?? q.localPhotos }
+            : q
+        )
       );
-      if (selectedInspection?.id === id) {
-        setSelectedInspection((prev) => (prev ? { ...prev, ...updatedData } : null));
+      deleteLocalFiles(p.removedLocalUris);
+      storeInspection({
+        ...insp,
+        ...p.data,
+        photos: (p.localPhotos || []).map((ph) => ({ url: ph.uri, photoType: ph.type })),
+      });
+      showToast('Inspección actualizada localmente', 'success');
+      return true;
+    }
+
+    // Registro ya en el servidor: se necesita conexión (igual que en la web).
+    if (!isRealToken(token) || !(await checkNetworkStatus())) {
+      showToast('Sin conexión: este registro ya está en el servidor, edítalo cuando vuelvas a tener red.', 'info');
+      return false;
+    }
+    try {
+      await apiRequest(`/inspections/${insp.id}`, { method: 'PATCH', body: JSON.stringify(p.data) }, token);
+
+      let failedMedia = 0;
+      for (const photoId of p.removedPhotoIds) {
+        try {
+          await apiRequest(`/photos/${photoId}`, { method: 'DELETE' }, token);
+        } catch {
+          failedMedia++;
+        }
       }
-      setEditingInspection(null);
-      showToast('Inspección actualizada', 'success');
-    } catch {
-      showToast('Error al actualizar inspección', 'error');
+      for (const photo of p.addedPhotos) {
+        try {
+          const formData = new FormData();
+          formData.append('file', {
+            uri: photo.uri,
+            name: photo.uri.split('/').pop() || `photo_${Date.now()}.jpg`,
+            type: 'image/jpeg',
+          } as any);
+          await apiRequest(
+            `/photos/upload/${insp.id}?photoType=foto&clientRequestId=${encodeURIComponent(
+              photoRequestId(`edit_${insp.id}`, photo.uri)
+            )}`,
+            { method: 'POST', body: formData },
+            token,
+            30000
+          );
+          deleteLocalFiles([photo.uri]);
+        } catch {
+          failedMedia++;
+        }
+      }
+
+      let photos = insp.photos;
+      if (p.removedPhotoIds.length > 0 || p.addedPhotos.length > 0) {
+        try {
+          const fresh = await apiRequest(`/photos/${insp.id}`, {}, token);
+          if (Array.isArray(fresh)) photos = fresh;
+        } catch {
+          /* se refresca en la próxima sincronización */
+        }
+      }
+      storeInspection({ ...insp, ...p.data, photos });
+      showToast(
+        failedMedia > 0
+          ? `Inspección actualizada, pero ${failedMedia} foto(s) no se pudieron actualizar.`
+          : 'Inspección actualizada',
+        failedMedia > 0 ? 'info' : 'success'
+      );
+      return true;
+    } catch (e: any) {
+      showToast(
+        isNetworkError(e) ? 'Sin conexión: no se pudo guardar. Inténtalo cuando vuelvas a tener red.' : e?.message || 'Error al actualizar inspección',
+        isNetworkError(e) ? 'info' : 'error'
+      );
+      return false;
     }
   };
 
@@ -755,12 +1197,41 @@ function MainApp() {
       onConfirm: async () => {
         setDialog((d) => ({ ...d, visible: false }));
         try {
-          await apiRequest(`/inspections/${insp.id}`, { method: 'DELETE' }, token);
-          setInspections((prev) => prev.filter((i) => i.id !== insp.id));
-          setSelectedInspection(null);
-          showToast('Registro eliminado', 'success');
-        } catch {
-          showToast('No se pudo eliminar el registro', 'error');
+          // Un registro con id numérico ya existe en el servidor aunque le falten fotos por subir.
+          const isLocal = String(insp.id).startsWith('local_');
+          const queued = pendingSyncList.find(
+            (p) => `local_${p.id}` === String(insp.id) || (insp.clientRequestId && p.id === normalizeClientRequestId(insp.clientRequestId))
+          );
+
+          if (isLocal) {
+            setInspections((prev) => {
+              const updated = prev.filter((i) => i.id !== insp.id);
+              AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(updated));
+              return updated;
+            });
+            updateQueue((prev) => prev.filter((p) => p.id !== queued?.id));
+            deleteLocalFiles((queued?.localPhotos || []).map((p) => p.uri));
+            setSelectedInspection(null);
+            showToast('Registro local eliminado', 'success');
+          } else {
+            await apiRequest(`/inspections/${insp.id}`, { method: 'DELETE' }, token);
+            if (queued) {
+              updateQueue((prev) => prev.filter((p) => p.id !== queued.id));
+              deleteLocalFiles(queued.localPhotos.map((p) => p.uri));
+            }
+            setInspections((prev) => {
+              const updated = prev.filter((i) => i.id !== insp.id);
+              AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(updated));
+              return updated;
+            });
+            setSelectedInspection(null);
+            showToast('Registro eliminado', 'success');
+          }
+        } catch (e: any) {
+          showToast(
+            isNetworkError(e) ? 'Sin conexión: este registro ya está en el servidor, elimínalo cuando vuelvas a tener red.' : 'No se pudo eliminar el registro',
+            isNetworkError(e) ? 'info' : 'error'
+          );
         }
       },
     });
@@ -814,50 +1285,8 @@ function MainApp() {
         </View>
 
         <View style={styles.topAppRight}>
-          {/* Plan Switcher Segmented Pill */}
-          <View style={[styles.planSwitchWrapper, { backgroundColor: theme.isDark ? '#1a273b' : '#f1f5f9' }]}>
-            <TouchableOpacity
-              style={[
-                styles.planSwitchTab,
-                plan === 'free' && styles.planSwitchTabActive,
-              ]}
-              onPress={() => handleSetPlan('free')}
-              activeOpacity={0.8}
-            >
-              <Text
-                style={[
-                  styles.planSwitchText,
-                  plan === 'free' ? styles.planSwitchTextActive : { color: theme.textSecondary },
-                ]}
-              >
-                Free
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[
-                styles.planSwitchTab,
-                plan === 'pro' && styles.planSwitchTabActive,
-              ]}
-              onPress={() => {
-                if (plan !== 'pro') {
-                  setShowPlanModal(true);
-                } else {
-                  handleSetPlan('pro');
-                }
-              }}
-              activeOpacity={0.8}
-            >
-              <Text
-                style={[
-                  styles.planSwitchText,
-                  plan === 'pro' ? styles.planSwitchTextActive : { color: theme.textSecondary },
-                ]}
-              >
-                Pro
-              </Text>
-            </TouchableOpacity>
-          </View>
+          {/* Text size (A- / A+) */}
+          <TextSizeControl theme={theme} />
 
           {/* Save / Sync Action Button */}
           <TouchableOpacity
@@ -877,6 +1306,16 @@ function MainApp() {
         </View>
       </View>
 
+      {!isOnline && (
+        <View style={styles.connectionBanner}>
+          <Feather name="wifi-off" size={13} color="#9a3412" />
+          <Text style={styles.connectionBannerText}>
+            Sin conexión · Puedes seguir inspeccionando; se guarda en el dispositivo
+            {pendingSyncList.length > 0 ? ` (${pendingSyncList.length} pendiente${pendingSyncList.length === 1 ? '' : 's'})` : ''} y se sincroniza al volver la red.
+          </Text>
+        </View>
+      )}
+
       {/* BODY VIEW SWITCHER */}
       {currentView === 'wizard' ? (
         <InspectionWizard
@@ -886,37 +1325,78 @@ function MainApp() {
           plan={plan}
           token={token}
           user={user}
-          onClose={() => setCurrentView('dashboard')}
-          onAddProject={(newProj) => {
-            setProjects((prev) => [...prev, newProj]);
+          key={editingInspection ? `edit-${editingInspection.id}` : 'new-inspection'}
+          editing={
+            editingInspection
+              ? {
+                  inspection: editingInspection,
+                  localPhotos:
+                    pendingSyncList.find(
+                      (q) =>
+                        `local_${q.id}` === String(editingInspection.id) ||
+                        (editingInspection.clientRequestId && q.id === normalizeClientRequestId(editingInspection.clientRequestId))
+                    )?.localPhotos ?? [],
+                }
+              : undefined
+          }
+          onUpdate={editingInspection ? (payload) => handleWizardUpdate(editingInspection, payload) : undefined}
+          onClose={() => {
+            setCurrentView('dashboard');
+            setEditingInspection(null);
+          }}
+          onAddProject={async (newProj) => {
+            setProjects((prev) => {
+              const updated = [...prev, newProj];
+              AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(updated));
+              return updated;
+            });
             setActiveProjectId(newProj.id);
-            AsyncStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify([...projects, newProj]));
+            // Una obra creada sin conexión debe subirse antes que sus inspecciones.
+            if (newProj.isLocalOnly) {
+              await writePendingProjects([...(await readPendingProjects()), newProj]);
+            }
           }}
           onSuccess={(newInsp, localPhotos) => {
-            setInspections((prev) => [newInsp, ...prev]);
-            if (localPhotos.length > 0 && newInsp.isPendingSync) {
-              setPendingSyncList((prev) => [
-                ...prev,
-                {
-                  id: String(newInsp.id),
-                  timestamp: Date.now(),
-                  data: {
-                    projectId: newInsp.projectId,
-                    material: newInsp.material,
-                    elementType: newInsp.elementType,
-                    code: newInsp.code,
-                    axis: newInsp.axis,
-                    level: newInsp.level,
-                    condition: newInsp.condition,
-                    observations: newInsp.observations,
-                    notes: newInsp.notes,
-                  },
-                  localPhotos,
+            setInspections((prev) => {
+              const updated = [newInsp, ...prev.filter((i) => i.id !== newInsp.id)];
+              AsyncStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(updated));
+              return updated;
+            });
+
+            if (newInsp.isPendingSync) {
+              const queueItem: PendingSyncItem = {
+                id: normalizeClientRequestId(newInsp.clientRequestId || String(newInsp.id)),
+                timestamp: Date.now(),
+                data: {
+                  projectId: newInsp.projectId,
+                  material: newInsp.material,
+                  elementType: newInsp.elementType,
+                  code: newInsp.code,
+                  axis: newInsp.axis,
+                  level: newInsp.level,
+                  condition: newInsp.condition,
+                  observations: newInsp.observations,
+                  notes: newInsp.notes,
                 },
-              ]);
+                localPhotos: (localPhotos || []).map((p) => ({
+                  uri: p.uri,
+                  type: p.type === 'audio' ? 'audio' : 'foto',
+                })),
+              };
+
+              updateQueue((prev) => [...prev.filter((item) => item.id !== queueItem.id), queueItem]);
+
+              // If online and real session, try to sync in the background
+              if (isRealToken(token)) syncOfflineQueue({ silent: true });
             }
+
             setCelebrationTrigger(true);
-            showToast('¡Inspección guardada exitosamente!', 'success');
+            showToast(
+              newInsp.isPendingSync
+                ? 'Inspección guardada en modo offline en tu dispositivo.'
+                : '¡Inspección guardada exitosamente!',
+              'success'
+            );
           }}
           showToast={showToast}
         />
@@ -935,11 +1415,6 @@ function MainApp() {
           onSyncNow={syncOfflineQueue}
           isSyncing={isSyncing}
           onOpenNewProject={() => {
-            if (plan === 'free' && projects.length >= limits.projects) {
-              setShowPlanModal(true);
-              showToast('Límite de proyectos alcanzado en el plan Básico.', 'info');
-              return;
-            }
             setEditingProject(null);
             setShowProjectModal(true);
           }}
@@ -954,14 +1429,15 @@ function MainApp() {
           }}
           onDeleteProject={handleDeleteProject}
           onOpenProjectDetail={openProjectDetail}
+          onRemoveMember={handleRemoveMember}
           detailProject={detailProject}
           onStartInspection={() => setCurrentView('wizard')}
           onSelectInspection={(insp) => setSelectedInspection(insp)}
-          onEditInspection={(insp) => setEditingInspection(insp)}
+          onEditInspection={openEditInspection}
           onDeleteInspection={handleDeleteInspection}
-          onOpenPlans={() => setShowPlanModal(true)}
           onOpenProfileEdit={() => setShowProfileModal(true)}
           onLogout={handleLogout}
+          onDeleteAccount={handleDeleteAccount}
           showToast={showToast}
           token={token}
           fetchData={() => fetchData(token)}
@@ -979,15 +1455,6 @@ function MainApp() {
       />
 
       {/* MODALS */}
-      {/* 1. Plan Modal */}
-      <PlanModal
-        visible={showPlanModal}
-        currentPlan={plan}
-        onClose={() => setShowPlanModal(false)}
-        onSelectPlan={handleSetPlan}
-        theme={theme}
-      />
-
       {/* 2. Inspection Detail Modal */}
       {selectedInspection && (
         <InspectionDetailModal
@@ -995,31 +1462,17 @@ function MainApp() {
           inspection={selectedInspection}
           theme={theme}
           onClose={() => setSelectedInspection(null)}
-          onEdit={() => {
-            setEditingInspection(selectedInspection);
-            setSelectedInspection(null);
-          }}
+          onEdit={() => openEditInspection(selectedInspection)}
           onDelete={() => handleDeleteInspection(selectedInspection)}
           onExportPDF={() => {
             generateAndSharePDF({
+              token,
               scope: 'inspection',
               inspections: [selectedInspection],
               user,
             });
           }}
           onPreviewImage={(uri) => setPreviewImageUri(uri)}
-        />
-      )}
-
-      {/* 3. Edit Inspection Modal */}
-      {editingInspection && (
-        <EditInspectionModal
-          visible={Boolean(editingInspection)}
-          inspection={editingInspection}
-          theme={theme}
-          onClose={() => setEditingInspection(null)}
-          onSave={(data) => handleSaveInspectionEdit(editingInspection.id, data)}
-          showToast={showToast}
         />
       )}
 
@@ -1125,10 +1578,19 @@ function AuthScreen({
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showForgotModal, setShowForgotModal] = useState(false);
+  const [lastSession, setLastSession] = useState<LastSession | null>(null);
+
+  useEffect(() => {
+    readLastSession().then(setLastSession);
+  }, []);
 
   const handleSubmit = async () => {
-    if (!email.trim() || !password.trim()) {
-      showToast('Por favor completa todos los campos requeridos.', 'error');
+    const missing: string[] = [];
+    if (isRegister && !name.trim()) missing.push('nombre completo');
+    if (!email.trim()) missing.push('correo electrónico');
+    if (!password.trim()) missing.push('contraseña');
+    if (missing.length) {
+      showToast(`Completa los campos obligatorios: ${missing.join(', ')}.`, 'error');
       return;
     }
 
@@ -1178,17 +1640,12 @@ function AuthScreen({
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior="padding"
       style={[styles.authContainer, { backgroundColor: theme.bg }]}
     >
       <ScrollView contentContainerStyle={[styles.authScroll, { paddingTop: Math.max(insets.top, 24), paddingBottom: Math.max(insets.bottom, 24) }]}>
         <View style={styles.authHeader}>
-          <View style={styles.authLogoBadge}>
-            <MaterialCommunityIcons name="shield-check" size={32} color="#2563eb" />
-          </View>
-          <Text style={styles.authTitle}>
-            INSPECT
-          </Text>
+          <Image source={require('./assets/logo.png')} style={styles.authLogo} resizeMode="contain" />
           <Text style={[styles.authSubtitle, { color: theme.textSecondary }]}>
             Evaluación Estructural y Rescate en Campo
           </Text>
@@ -1209,8 +1666,17 @@ function AuthScreen({
           </Text>
 
           {isRegister && (
+            <Text style={[styles.requiredNote, { color: theme.textSecondary, backgroundColor: theme.cardSecondary, borderColor: theme.border }]}>
+              Los campos con <Text style={{ color: theme.danger, fontWeight: '900' }}>*</Text> son obligatorios: nombre
+              completo, correo electrónico y contraseña. Especialidad y colegiatura son opcionales.
+            </Text>
+          )}
+
+          {isRegister && (
             <>
-              <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>NOMBRE COMPLETO</Text>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>
+                NOMBRE COMPLETO <Text style={{ color: theme.danger }}>*</Text>
+              </Text>
               <TextInput
                 style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
                 placeholder="Ej. Ing. Carlos Mendoza"
@@ -1219,7 +1685,7 @@ function AuthScreen({
                 onChangeText={setName}
               />
 
-              <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>ESPECIALIDAD</Text>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>ESPECIALIDAD (OPCIONAL)</Text>
               <TextInput
                 style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
                 placeholder="Ej. Estructuras / Geotecnia"
@@ -1228,7 +1694,7 @@ function AuthScreen({
                 onChangeText={setSpecialty}
               />
 
-              <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>Nº COLEGIATURA / LICENCIA (CIP)</Text>
+              <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>Nº COLEGIATURA / LICENCIA (CIP) (OPCIONAL)</Text>
               <TextInput
                 style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
                 placeholder="Ej. CIP-189234"
@@ -1239,7 +1705,9 @@ function AuthScreen({
             </>
           )}
 
-          <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CORREO ELECTRÓNICO</Text>
+          <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>
+            CORREO ELECTRÓNICO {isRegister && <Text style={{ color: theme.danger }}>*</Text>}
+          </Text>
           <TextInput
             style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
             placeholder="contacto@vertexdev.tech"
@@ -1250,7 +1718,9 @@ function AuthScreen({
             onChangeText={setEmail}
           />
 
-          <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CONTRASEÑA</Text>
+          <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>
+            CONTRASEÑA {isRegister && <Text style={{ color: theme.danger }}>*</Text>}
+          </Text>
           <View style={styles.passwordRow}>
             <TextInput
               style={[styles.input, { flex: 1, backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
@@ -1306,27 +1776,18 @@ function AuthScreen({
             </Text>
           </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[styles.guestButton, { borderColor: theme.border, backgroundColor: theme.cardSecondary }]}
-            onPress={() => {
-              const guestUser: User = {
-                id: Date.now(),
-                name: 'Jean Paul - Inspector',
-                email: 'contacto@vertexdev.tech',
-                username: 'jean',
-                role: 'admin',
-                specialty: 'Estructuras y Obras',
-                plan: 'pro',
-              };
-              onLoginSuccess('offline-guest-token', guestUser);
-            }}
-            activeOpacity={0.8}
-          >
-            <Feather name="shield" size={14} color={theme.primary} />
-            <Text style={[styles.guestButtonText, { color: theme.text }]}>
-              Ingresar en Modo Campo (Offline)
-            </Text>
-          </TouchableOpacity>
+          {lastSession ? (
+            <TouchableOpacity
+              style={[styles.guestButton, { borderColor: theme.border, backgroundColor: theme.cardSecondary }]}
+              onPress={() => onLoginSuccess(lastSession.token, lastSession.user)}
+              activeOpacity={0.8}
+            >
+              <Feather name="wifi-off" size={14} color={theme.primary} />
+              <Text style={[styles.guestButtonText, { color: theme.text }]}>
+                Continuar sin conexión como {lastSession.user?.name || lastSession.user?.email}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
       </ScrollView>
 
@@ -1394,7 +1855,7 @@ function ForgotPasswordModal({
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+      <KeyboardAvoidingView behavior="padding" style={styles.modalOverlay}>
         <View
           style={[
             styles.modalContainer,
@@ -1510,14 +1971,15 @@ interface DashboardScreenProps {
   onEditProject: (p: Project) => void;
   onDeleteProject: (p: Project) => void;
   onOpenProjectDetail: (p: Project) => void;
+  onRemoveMember: (p: Project, m: ProjectMember) => void;
   detailProject: Project | null;
   onStartInspection: () => void;
   onSelectInspection: (i: Inspection) => void;
   onEditInspection: (i: Inspection) => void;
   onDeleteInspection: (i: Inspection) => void;
-  onOpenPlans: () => void;
   onOpenProfileEdit: () => void;
   onLogout: () => void;
+  onDeleteAccount: (password: string) => Promise<void>;
   showToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
   token: string | null;
   fetchData: () => void;
@@ -1542,14 +2004,15 @@ function DashboardScreen({
   onEditProject,
   onDeleteProject,
   onOpenProjectDetail,
+  onRemoveMember,
   detailProject,
   onStartInspection,
   onSelectInspection,
   onEditInspection,
   onDeleteInspection,
-  onOpenPlans,
   onOpenProfileEdit,
   onLogout,
+  onDeleteAccount,
   showToast,
   token,
   fetchData,
@@ -1557,6 +2020,27 @@ function DashboardScreen({
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const isSmall = width < 360;
+
+  // Delete account state
+  const [showDeleteAccount, setShowDeleteAccount] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deletingAccount, setDeletingAccount] = useState(false);
+
+  const closeDeleteAccount = () => {
+    if (deletingAccount) return;
+    setShowDeleteAccount(false);
+    setDeletePassword('');
+  };
+
+  const confirmDeleteAccount = async () => {
+    setDeletingAccount(true);
+    try {
+      await onDeleteAccount(deletePassword);
+    } catch (err: any) {
+      showToast(err?.message || 'No se pudo eliminar la cuenta.', 'error');
+      setDeletingAccount(false);
+    }
+  };
 
   // Filter States for Records Tab
   const [filterProject, setFilterProject] = useState<number | 'all'>('all');
@@ -1678,11 +2162,6 @@ function DashboardScreen({
                 <TouchableOpacity
                   style={[styles.exportBadgeBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
                   onPress={() => {
-                    if (plan !== 'pro') {
-                      onOpenPlans();
-                      showToast('La exportación a Excel requiere el plan Pro.', 'info');
-                      return;
-                    }
                     generateAndShareExcel({
                       scope: 'global',
                       inspections,
@@ -1693,21 +2172,14 @@ function DashboardScreen({
                 >
                   <Feather name="download" size={13} color={theme.textSecondary} />
                   <Text style={[styles.exportBadgeBtnText, { color: theme.text }]}>Excel</Text>
-                  <View style={[styles.proBadgePill, { backgroundColor: plan === 'pro' ? '#2563eb' : '#e2e8f0' }]}>
-                    <Text style={[styles.proBadgePillText, { color: plan === 'pro' ? '#ffffff' : '#64748b' }]}>PRO</Text>
-                  </View>
                 </TouchableOpacity>
 
                 {/* PDF Global [Pro] Button */}
                 <TouchableOpacity
                   style={[styles.exportBadgeBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
                   onPress={() => {
-                    if (plan !== 'pro') {
-                      onOpenPlans();
-                      showToast('El Dossier Global PDF requiere el plan Pro.', 'info');
-                      return;
-                    }
                     generateAndSharePDF({
+                      token,
                       scope: 'global',
                       inspections,
                       user,
@@ -1717,9 +2189,6 @@ function DashboardScreen({
                 >
                   <Feather name="download" size={13} color={theme.textSecondary} />
                   <Text style={[styles.exportBadgeBtnText, { color: theme.text }]}>PDF global</Text>
-                  <View style={[styles.proBadgePill, { backgroundColor: plan === 'pro' ? '#2563eb' : '#e2e8f0' }]}>
-                    <Text style={[styles.proBadgePillText, { color: plan === 'pro' ? '#ffffff' : '#64748b' }]}>PRO</Text>
-                  </View>
                 </TouchableOpacity>
               </View>
             </View>
@@ -1772,99 +2241,34 @@ function DashboardScreen({
               </View>
             </View>
 
-            {/* "USO DEL PLAN" Card */}
+            {/* "TU PLAN" Card: todos los usuarios tienen Pro */}
             <View style={[styles.planUsageCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <View style={styles.planUsageHeader}>
                 <View>
-                  <Text style={[styles.planUsageEyebrow, { color: theme.textSecondary }]}>USO DEL PLAN</Text>
-                  <Text style={[styles.planUsageTitle, { color: theme.text }]}>
-                    PS Inspect {plan === 'pro' ? 'Pro' : 'Free'}
-                  </Text>
+                  <Text style={[styles.planUsageEyebrow, { color: theme.textSecondary }]}>TU PLAN</Text>
+                  <Text style={[styles.planUsageTitle, { color: theme.text }]}>PS Inspect Pro</Text>
                 </View>
-
-                <TouchableOpacity
-                  style={[styles.upgradePlanButton, { backgroundColor: theme.primary }]}
-                  onPress={onOpenPlans}
-                  activeOpacity={0.85}
-                >
-                  <Text style={styles.upgradePlanButtonText}>Mejorar plan</Text>
-                </TouchableOpacity>
               </View>
 
-              {/* 3 Progress sub-boxes */}
               <View style={styles.planMetricsRow}>
-                {/* Projects */}
                 <View style={[styles.planMetricBox, { backgroundColor: theme.isDark ? '#0e1826' : '#f8fafc', borderColor: theme.border }]}>
                   <View style={styles.planMetricValueRow}>
-                    <Text style={[styles.planMetricCount, { color: theme.text }]}>
-                      {projects.length} de {limits.projects === Infinity ? '∞' : limits.projects}
-                    </Text>
+                    <Text style={[styles.planMetricCount, { color: theme.text }]}>{projects.length}</Text>
                     <Text style={[styles.planMetricName, { color: theme.textSecondary }]}>Proyectos</Text>
                   </View>
-                  <View style={[styles.planProgressTrack, { backgroundColor: theme.isDark ? '#20334d' : '#e2e8f0' }]}>
-                    <View
-                      style={[
-                        styles.planProgressFill,
-                        {
-                          width: `${limits.projects === Infinity ? (projects.length > 0 ? 30 : 0) : Math.min((projects.length / limits.projects) * 100, 100)}%`,
-                          backgroundColor: '#f97316',
-                        },
-                      ]}
-                    />
-                  </View>
                 </View>
-
-                {/* Inspections */}
                 <View style={[styles.planMetricBox, { backgroundColor: theme.isDark ? '#0e1826' : '#f8fafc', borderColor: theme.border }]}>
                   <View style={styles.planMetricValueRow}>
-                    <Text style={[styles.planMetricCount, { color: theme.text }]}>
-                      {inspections.length} de {limits.inspectionsPerProject === Infinity ? '∞' : limits.inspectionsPerProject}
-                    </Text>
+                    <Text style={[styles.planMetricCount, { color: theme.text }]}>{inspections.length}</Text>
                     <Text style={[styles.planMetricName, { color: theme.textSecondary }]}>Inspecciones</Text>
                   </View>
-                  <View style={[styles.planProgressTrack, { backgroundColor: theme.isDark ? '#20334d' : '#e2e8f0' }]}>
-                    <View
-                      style={[
-                        styles.planProgressFill,
-                        {
-                          width: `${limits.inspectionsPerProject === Infinity ? (inspections.length > 0 ? 30 : 0) : Math.min((inspections.length / limits.inspectionsPerProject) * 100, 100)}%`,
-                          backgroundColor: '#2563eb',
-                        },
-                      ]}
-                    />
-                  </View>
                 </View>
-
-                {/* Inspectors */}
                 <View style={[styles.planMetricBox, { backgroundColor: theme.isDark ? '#0e1826' : '#f8fafc', borderColor: theme.border }]}>
                   <View style={styles.planMetricValueRow}>
-                    <Text style={[styles.planMetricCount, { color: theme.text }]}>
-                      1 de {limits.inspectors}
-                    </Text>
-                    <Text style={[styles.planMetricName, { color: theme.textSecondary }]}>Inspectores</Text>
-                  </View>
-                  <View style={[styles.planProgressTrack, { backgroundColor: theme.isDark ? '#20334d' : '#e2e8f0' }]}>
-                    <View
-                      style={[
-                        styles.planProgressFill,
-                        {
-                          width: `${Math.min((1 / limits.inspectors) * 100, 100)}%`,
-                          backgroundColor: '#f97316',
-                        },
-                      ]}
-                    />
+                    <Text style={[styles.planMetricCount, { color: theme.text }]}>{limits.photosPerInspection}</Text>
+                    <Text style={[styles.planMetricName, { color: theme.textSecondary }]}>Fotos por inspección</Text>
                   </View>
                 </View>
-              </View>
-
-              {/* Footer */}
-              <View style={styles.planUsageFooter}>
-                <Text style={[styles.planUsageFooterLeft, { color: theme.primary }]}>
-                  {limits.photosPerInspection} fotografía por inspección
-                </Text>
-                <Text style={[styles.planUsageFooterRight, { color: theme.textSecondary }]}>
-                  {plan === 'free' ? 'Has alcanzado 2 límites del plan Free' : 'Sin límites de almacenamiento'}
-                </Text>
               </View>
             </View>
 
@@ -1928,6 +2332,12 @@ function DashboardScreen({
                         <Text style={[styles.recentInspSub, { color: theme.textSecondary }]} numberOfLines={1}>
                           {insp.level || 'Nivel 01'} · {insp.axis || 'Eje A'} · {insp.condition} · {inspectorName}
                         </Text>
+                        {insp.isPendingSync && (
+                          <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff7ed', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, alignSelf: 'flex-start', marginTop: 4, borderWidth: 1, borderColor: '#fed7aa' }}>
+                            <Feather name="cloud-off" size={10} color="#ea580c" style={{ marginRight: 4 }} />
+                            <Text style={{ color: '#ea580c', fontSize: 10, fontWeight: '800' }}>PENDIENTE SYNC</Text>
+                          </View>
+                        )}
                       </View>
 
                       {/* Right Actions & Badge */}
@@ -1983,31 +2393,6 @@ function DashboardScreen({
                 </TouchableOpacity>
               </View>
             </View>
-
-            {/* Usage Bar (Projects quota in Free plan) */}
-            {plan === 'free' && (
-              <View style={[styles.usageCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-                <View style={styles.usageCardHeader}>
-                  <Text style={[styles.usageCardTitle, { color: theme.text }]}>
-                    Proyectos Utilizados: {projects.length} de {limits.projects}
-                  </Text>
-                  <TouchableOpacity onPress={onOpenPlans}>
-                    <Text style={{ color: theme.primary, fontSize: 11, fontWeight: '800' }}>SUBIR A PRO 🚀</Text>
-                  </TouchableOpacity>
-                </View>
-                <View style={[styles.usageBarTrack, { backgroundColor: theme.cardSecondary }]}>
-                  <View
-                    style={[
-                      styles.usageBarFill,
-                      {
-                        width: `${Math.min((projects.length / limits.projects) * 100, 100)}%`,
-                        backgroundColor: projects.length >= limits.projects ? theme.danger : theme.primary,
-                      },
-                    ]}
-                  />
-                </View>
-              </View>
-            )}
 
             {projects.length === 0 ? (
               <View style={[styles.emptyListCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
@@ -2175,6 +2560,7 @@ function DashboardScreen({
                         style={[styles.exportActionBtn, { backgroundColor: theme.primary }]}
                         onPress={() => {
                           generateAndSharePDF({
+                            token,
                             scope: 'project',
                             project: detailProject,
                             inspections: pInsps,
@@ -2196,11 +2582,6 @@ function DashboardScreen({
                           },
                         ]}
                         onPress={() => {
-                          if (plan !== 'pro') {
-                            onOpenPlans();
-                            showToast('La exportación a Excel está disponible en el plan Pro.', 'info');
-                            return;
-                          }
                           generateAndShareExcel({
                             scope: 'project',
                             project: detailProject,
@@ -2220,7 +2601,7 @@ function DashboardScreen({
                             { color: plan === 'pro' ? '#ffffff' : theme.textSecondary },
                           ]}
                         >
-                          Excel (.csv) {plan !== 'pro' ? '🔒 PRO' : ''}
+                          Excel (.csv)
                         </Text>
                       </TouchableOpacity>
                     </View>
@@ -2264,6 +2645,47 @@ function DashboardScreen({
                   <Text style={styles.shareActionBtnText}>Compartir</Text>
                 </TouchableOpacity>
               </View>
+
+              {(detailProject.members || []).length > 0 && (
+                <View style={{ marginTop: 12, gap: 6 }}>
+                  {(detailProject.members || []).map((m, mIdx) => {
+                    const memberId = m.id ?? m.userId;
+                    const iAmOwner =
+                      detailProject.myRole === 'owner' ||
+                      (detailProject.members || []).some((x) => (x.id ?? x.userId) === user?.id && x.role === 'owner');
+                    const canRemove = isRealToken(token) && iAmOwner && m.role !== 'owner' && memberId !== user?.id;
+                    return (
+                      <View
+                        key={`member-${memberId ?? mIdx}`}
+                        style={{
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          padding: 8,
+                          borderRadius: 8,
+                          borderWidth: 1,
+                          borderColor: theme.border,
+                          backgroundColor: theme.cardSecondary,
+                        }}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ color: theme.text, fontSize: 13, fontWeight: '700' }} numberOfLines={1}>
+                            {m.name || m.email || 'Inspector'}
+                          </Text>
+                          <Text style={{ color: theme.textSecondary, fontSize: 11 }} numberOfLines={1}>
+                            {m.role === 'owner' ? 'Responsable' : 'Inspector'}
+                            {m.specialty ? ` · ${m.specialty}` : ''}
+                          </Text>
+                        </View>
+                        {canRemove && (
+                          <TouchableOpacity onPress={() => onRemoveMember(detailProject, m)} hitSlop={8}>
+                            <Feather name="user-minus" size={16} color={theme.danger} />
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
 
               <TouchableOpacity
                 style={[styles.inviteEmailBtn, { borderColor: theme.border, backgroundColor: theme.cardSecondary }]}
@@ -2340,12 +2762,8 @@ function DashboardScreen({
                     { backgroundColor: plan === 'pro' ? theme.primary : theme.cardSecondary },
                   ]}
                   onPress={() => {
-                    if (plan !== 'pro') {
-                      onOpenPlans();
-                      showToast('El Dossier Global PDF está disponible en el plan Pro.', 'info');
-                      return;
-                    }
                     generateAndSharePDF({
+                      token,
                       scope: 'global',
                       inspections,
                       user,
@@ -2354,7 +2772,7 @@ function DashboardScreen({
                 >
                   <Feather name="file-text" size={14} color={plan === 'pro' ? '#fff' : theme.textSecondary} />
                   <Text style={[styles.scopeExportBtnText, { color: plan === 'pro' ? '#fff' : theme.textSecondary }]}>
-                    Dossier PDF Global {plan !== 'pro' ? '🔒 PRO' : ''}
+                    Dossier PDF Global
                   </Text>
                 </TouchableOpacity>
 
@@ -2364,11 +2782,6 @@ function DashboardScreen({
                     { backgroundColor: plan === 'pro' ? theme.success : theme.cardSecondary },
                   ]}
                   onPress={() => {
-                    if (plan !== 'pro') {
-                      onOpenPlans();
-                      showToast('La exportación general a Excel está disponible en el plan Pro.', 'info');
-                      return;
-                    }
                     generateAndShareExcel({
                       scope: 'global',
                       inspections,
@@ -2382,7 +2795,7 @@ function DashboardScreen({
                     color={plan === 'pro' ? '#fff' : theme.textSecondary}
                   />
                   <Text style={[styles.scopeExportBtnText, { color: plan === 'pro' ? '#fff' : theme.textSecondary }]}>
-                    Excel Completo {plan !== 'pro' ? '🔒 PRO' : ''}
+                    Excel Completo
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -2412,6 +2825,7 @@ function DashboardScreen({
                       style={[styles.cardActionBtn, { backgroundColor: theme.primary }]}
                       onPress={() => {
                         generateAndSharePDF({
+                          token,
                           scope: 'project',
                           project: proj,
                           inspections: pInsps,
@@ -2428,11 +2842,6 @@ function DashboardScreen({
                         { backgroundColor: plan === 'pro' ? theme.success : theme.cardSecondary },
                       ]}
                       onPress={() => {
-                        if (plan !== 'pro') {
-                          onOpenPlans();
-                          showToast('Exportación Excel disponible en el plan Pro.', 'info');
-                          return;
-                        }
                         generateAndShareExcel({
                           scope: 'project',
                           project: proj,
@@ -2498,23 +2907,13 @@ function DashboardScreen({
             <View style={[styles.planStatusCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <View style={styles.planStatusHeader}>
                 <View>
-                  <Text style={styles.sectionEyebrow}>PLAN DE SUSCRIPCIÓN</Text>
-                  <Text style={[styles.planStatusTitle, { color: theme.text }]}>
-                    Plan Activo: {plan === 'pro' ? 'Pro 🚀' : 'Básico (Gratis)'}
-                  </Text>
+                  <Text style={styles.sectionEyebrow}>TU PLAN</Text>
+                  <Text style={[styles.planStatusTitle, { color: theme.text }]}>Plan Pro 🚀 incluido para todos</Text>
                 </View>
-                <TouchableOpacity
-                  style={[styles.upgradePlanBtn, { backgroundColor: theme.primary }]}
-                  onPress={onOpenPlans}
-                >
-                  <Text style={styles.upgradePlanBtnText}>Cambiar Plan</Text>
-                </TouchableOpacity>
               </View>
 
               <Text style={[styles.planLimitsSummary, { color: theme.textSecondary }]}>
-                {plan === 'pro'
-                  ? '• Proyectos e inspecciones ilimitadas\n• Hasta 20 fotos por inspección\n• Exportación Excel y Dossier Global PDF'
-                  : '• Hasta 3 proyectos simultáneos\n• Hasta 50 inspecciones por obra\n• 1 foto por elemento (PDF individual incluido)'}
+                {'• Proyectos e inspecciones ilimitadas\n• Hasta 20 fotos por inspección\n• Exportación Excel y Dossier Global PDF'}
               </Text>
             </View>
 
@@ -2553,6 +2952,64 @@ function DashboardScreen({
                 onAlertSent={(msg, isErr) => showToast(msg, isErr ? 'error' : 'success')}
               />
             </View>
+
+            {/* Danger Zone: Delete Account */}
+            <TouchableOpacity
+              style={[styles.deleteAccountBtn, { borderColor: theme.danger }]}
+              onPress={() => setShowDeleteAccount(true)}
+            >
+              <Feather name="trash-2" size={14} color={theme.danger} />
+              <Text style={[styles.deleteAccountBtnText, { color: theme.danger }]}>Eliminar mi cuenta</Text>
+            </TouchableOpacity>
+
+            <Modal visible={showDeleteAccount} transparent animationType="fade" onRequestClose={closeDeleteAccount}>
+              <View style={styles.modalOverlay}>
+                <View style={[styles.dialogBox, { backgroundColor: theme.card, borderColor: theme.border }]}>
+                  <Text style={[styles.dialogTitle, { color: theme.text }]}>Eliminar cuenta</Text>
+                  <Text style={[styles.dialogMsg, { color: theme.textSecondary }]}>
+                    Esta acción es permanente. Se borrarán tu perfil, tus inspecciones y las obras donde seas el único
+                    miembro. Si compartes una obra, la titularidad pasará a otro miembro.
+                  </Text>
+
+                  {token && token !== 'offline-guest-token' && (
+                    <TextInput
+                      style={[
+                        styles.input,
+                        { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text, marginBottom: 16 },
+                      ]}
+                      placeholder="Confirma con tu contraseña"
+                      placeholderTextColor={theme.textMuted}
+                      secureTextEntry
+                      autoCapitalize="none"
+                      value={deletePassword}
+                      onChangeText={setDeletePassword}
+                      editable={!deletingAccount}
+                    />
+                  )}
+
+                  <View style={styles.dialogButtonsRow}>
+                    <TouchableOpacity
+                      style={[styles.dialogBtn, { backgroundColor: theme.cardSecondary }]}
+                      onPress={closeDeleteAccount}
+                      disabled={deletingAccount}
+                    >
+                      <Text style={{ color: theme.text, fontWeight: '700' }}>Cancelar</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.dialogBtn, { backgroundColor: theme.danger, opacity: deletingAccount ? 0.7 : 1 }]}
+                      onPress={confirmDeleteAccount}
+                      disabled={deletingAccount}
+                    >
+                      {deletingAccount ? (
+                        <ActivityIndicator size="small" color="#ffffff" />
+                      ) : (
+                        <Text style={{ color: '#ffffff', fontWeight: '800' }}>Eliminar</Text>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              </View>
+            </Modal>
 
             {/* Admin SOS Panel Shortcut - Only visible to Admins */}
             {isAdmin && (
@@ -2773,6 +3230,16 @@ function InspectionDetailModal({
           </View>
 
           <ScrollView style={{ maxHeight: 480 }} showsVerticalScrollIndicator={false}>
+            {/* Offline Pending Sync Banner */}
+            {inspection.isPendingSync && (
+              <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff7ed', borderWidth: 1, borderColor: '#fed7aa', padding: 10, borderRadius: 8, marginBottom: 12 }}>
+                <Feather name="cloud-off" size={16} color="#ea580c" />
+                <Text style={{ color: '#c2410c', fontSize: 12, fontWeight: '700', marginLeft: 8, flex: 1 }}>
+                  Registro guardado en modo offline en este dispositivo. Se sincronizará automáticamente con el servidor cuando haya conexión.
+                </Text>
+              </View>
+            )}
+
             {/* Condition Banner */}
             <View style={[styles.detailCondBanner, { backgroundColor: condColor }]}>
               <Text style={styles.detailCondBannerText}>
@@ -2802,7 +3269,7 @@ function InspectionDetailModal({
             <Text style={[styles.detailSectionTitle, { color: theme.text }]}>Hallazgos y Patologías</Text>
             <View style={[styles.detailObsBox, { backgroundColor: theme.cardSecondary, borderColor: theme.secondary }]}>
               <Text style={[styles.detailObsText, { color: theme.text }]}>
-                {inspection.observations || 'Sin patologías registradas'}
+                {inspection.observations ? inspection.observations.split('; ').join('\n') : 'Sin patologías registradas'}
               </Text>
             </View>
 
@@ -2814,21 +3281,63 @@ function InspectionDetailModal({
               </View>
             ) : null}
 
-            {/* Photos */}
-            {inspection.photos && inspection.photos.length > 0 && (
-              <View style={{ marginTop: 14 }}>
-                <Text style={[styles.detailSectionTitle, { color: theme.text }]}>
-                  Fotografías ({inspection.photos.length})
-                </Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 6 }}>
-                  {inspection.photos.map((p, idx) => (
-                    <TouchableOpacity key={`det-p-${idx}`} onPress={() => onPreviewImage(p.url)}>
-                      <Image source={{ uri: p.url }} style={styles.detailPhotoItem} />
-                    </TouchableOpacity>
-                  ))}
-                </ScrollView>
-              </View>
-            )}
+            {/* Photos & Audio Evidence */}
+            {(() => {
+              const normalPhotos = (inspection.photos || []).filter((p) => p.photoType !== 'audio');
+              const audioNotes = (inspection.photos || []).filter((p) => p.photoType === 'audio');
+
+              return (
+                <>
+                  {normalPhotos.length > 0 && (
+                    <View style={{ marginTop: 14 }}>
+                      <Text style={[styles.detailSectionTitle, { color: theme.text }]}>
+                        Fotografías ({normalPhotos.length})
+                      </Text>
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 6 }}>
+                        {normalPhotos.map((p, idx) => (
+                          <TouchableOpacity key={`det-p-${idx}`} onPress={() => onPreviewImage(p.url)}>
+                            <Image source={{ uri: p.url }} style={styles.detailPhotoItem} />
+                          </TouchableOpacity>
+                        ))}
+                      </ScrollView>
+                    </View>
+                  )}
+
+                  {audioNotes.length > 0 && (
+                    <View style={{ marginTop: 14 }}>
+                      <Text style={[styles.detailSectionTitle, { color: theme.text }]}>
+                        Notas de Voz ({audioNotes.length})
+                      </Text>
+                      <View style={{ gap: 8, marginTop: 6 }}>
+                        {audioNotes.map((a, aIdx) => (
+                          <TouchableOpacity
+                            key={`det-a-${aIdx}`}
+                            style={{
+                              flexDirection: 'row',
+                              alignItems: 'center',
+                              backgroundColor: theme.cardSecondary,
+                              padding: 10,
+                              borderRadius: 8,
+                              borderWidth: 1,
+                              borderColor: theme.border,
+                            }}
+                            onPress={() => {
+                              if (a.url) Linking.openURL(a.url).catch(() => {});
+                            }}
+                          >
+                            <MaterialCommunityIcons name="microphone" size={20} color={theme.primary} />
+                            <Text style={{ flex: 1, marginLeft: 8, color: theme.text, fontSize: 13, fontWeight: '600' }}>
+                              Nota de audio {aIdx + 1}
+                            </Text>
+                            <Feather name="external-link" size={14} color={theme.textSecondary} />
+                          </TouchableOpacity>
+                        ))}
+                      </View>
+                    </View>
+                  )}
+                </>
+              );
+            })()}
 
             {/* Action Buttons */}
             <View style={styles.detailActionsRow}>
@@ -2857,147 +3366,6 @@ function InspectionDetailModal({
           </ScrollView>
         </View>
       </View>
-    </Modal>
-  );
-}
-
-// ==========================================
-// EDIT INSPECTION MODAL
-// ==========================================
-function EditInspectionModal({
-  visible,
-  inspection,
-  theme,
-  onClose,
-  onSave,
-  showToast,
-}: {
-  visible: boolean;
-  inspection: Inspection;
-  theme: ThemeType;
-  onClose: () => void;
-  onSave: (data: Partial<Inspection>) => void;
-  showToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
-}) {
-  const insets = useSafeAreaInsets();
-  const [code, setCode] = useState(inspection.code || '');
-  const [axis, setAxis] = useState(inspection.axis || '');
-  const [level, setLevel] = useState(inspection.level || '');
-  const [condition, setCondition] = useState<number>(inspection.condition || 1);
-  const [observations, setObservations] = useState(inspection.observations || '');
-  const [notes, setNotes] = useState(inspection.notes || '');
-
-  const handleSubmit = () => {
-    if (!code.trim() || !axis.trim()) {
-      showToast('Código y eje son obligatorios.', 'error');
-      return;
-    }
-    onSave({
-      code: code.trim().toUpperCase(),
-      axis: axis.trim(),
-      level: level.trim(),
-      condition,
-      observations: observations.trim(),
-      notes: notes.trim(),
-    });
-  };
-
-  return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
-        <View
-          style={[
-            styles.modalContainer,
-            {
-              backgroundColor: theme.card,
-              borderColor: theme.border,
-              paddingBottom: Math.max(insets.bottom, 20),
-            },
-          ]}
-        >
-          <View style={styles.modalHeader}>
-            <View>
-              <Text style={styles.eyebrow}>EDITAR REGISTRO</Text>
-              <Text style={[styles.title, { color: theme.text }]}>{inspection.code}</Text>
-            </View>
-            <TouchableOpacity onPress={onClose} style={[styles.closeBtn, { backgroundColor: theme.cardSecondary }]}>
-              <Feather name="x" size={18} color={theme.text} />
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView style={{ maxHeight: 440 }} showsVerticalScrollIndicator={false}>
-            <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CÓDIGO</Text>
-            <TextInput
-              style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-              value={code}
-              onChangeText={setCode}
-            />
-
-            <View style={styles.formRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>EJE</Text>
-                <TextInput
-                  style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-                  value={axis}
-                  onChangeText={setAxis}
-                />
-              </View>
-              <View style={{ flex: 1, marginLeft: 10 }}>
-                <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>NIVEL</Text>
-                <TextInput
-                  style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-                  value={level}
-                  onChangeText={setLevel}
-                />
-              </View>
-            </View>
-
-            <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>CONDICIÓN (1-5)</Text>
-            <View style={styles.conditionFilterRow}>
-              {[1, 2, 3, 4, 5].map((c) => (
-                <TouchableOpacity
-                  key={`edit-c-${c}`}
-                  style={[
-                    styles.condTagBtn,
-                    {
-                      backgroundColor: condition === c ? getConditionColor(c, theme) : theme.cardSecondary,
-                      borderColor: condition === c ? getConditionColor(c, theme) : theme.border,
-                    },
-                  ]}
-                  onPress={() => setCondition(c)}
-                >
-                  <Text style={{ color: condition === c ? '#fff' : theme.text, fontWeight: '800', fontSize: 12 }}>
-                    C{c}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            <Text style={[styles.inputLabel, { color: theme.textSecondary, marginTop: 10 }]}>PATOLOGÍAS / OBSERVACIONES</Text>
-            <TextInput
-              style={[styles.input, { height: 60, textAlignVertical: 'top', backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-              value={observations}
-              onChangeText={setObservations}
-              multiline
-            />
-
-            <Text style={[styles.inputLabel, { color: theme.textSecondary, marginTop: 10 }]}>NOTAS</Text>
-            <TextInput
-              style={[styles.input, { height: 50, textAlignVertical: 'top', backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
-              value={notes}
-              onChangeText={setNotes}
-              multiline
-            />
-
-            <TouchableOpacity
-              style={[styles.primaryButton, { backgroundColor: theme.primary, marginTop: 18 }]}
-              onPress={handleSubmit}
-            >
-              <Text style={styles.primaryButtonText}>Guardar Cambios</Text>
-            </TouchableOpacity>
-          </ScrollView>
-        </View>
-      </KeyboardAvoidingView>
     </Modal>
   );
 }
@@ -3043,7 +3411,7 @@ function ProjectModal({
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+      <KeyboardAvoidingView behavior="padding" style={styles.modalOverlay}>
         <View
           style={[
             styles.modalContainer,
@@ -3215,7 +3583,7 @@ function JoinProjectModal({
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+      <KeyboardAvoidingView behavior="padding" style={styles.modalOverlay}>
         <View
           style={[
             styles.modalContainer,
@@ -3346,7 +3714,7 @@ function InviteInspectorModal({
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+      <KeyboardAvoidingView behavior="padding" style={styles.modalOverlay}>
         <View
           style={[
             styles.modalContainer,
@@ -3515,7 +3883,7 @@ function ProfileEditModal({
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalOverlay}>
+      <KeyboardAvoidingView behavior="padding" style={styles.modalOverlay}>
         <View
           style={[
             styles.modalContainer,
@@ -3730,6 +4098,22 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '900',
     letterSpacing: 0.5,
+  },
+  connectionBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    backgroundColor: '#fff7ed',
+    borderBottomWidth: 1,
+    borderBottomColor: '#fed7aa',
+  },
+  connectionBannerText: {
+    flex: 1,
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#9a3412',
   },
   psLogoDot: {
     position: 'absolute',
@@ -4579,6 +4963,20 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '800',
   },
+  deleteAccountBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingVertical: 11,
+    marginBottom: 12,
+  },
+  deleteAccountBtnText: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
 
   // Usage Card
   usageCard: {
@@ -4994,6 +5392,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 16,
   },
+  authLogo: {
+    width: 220,
+    height: 200,
+    marginBottom: 6,
+    borderRadius: 16,
+  },
   authLogoBadge: {
     width: 56,
     height: 56,
@@ -5043,6 +5447,15 @@ const styles = StyleSheet.create({
     letterSpacing: 0.6,
     marginBottom: 4,
   },
+  requiredNote: {
+    fontSize: 11,
+    lineHeight: 16,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 12,
+  },
   input: {
     borderWidth: 1,
     borderRadius: 8,
@@ -5060,6 +5473,69 @@ const styles = StyleSheet.create({
     position: 'absolute',
     right: 10,
     top: 10,
+  },
+  editChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  editChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  editChipText: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  editObsRow: {
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 6,
+  },
+  editObsMain: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  editObsCheck: {
+    width: 20,
+    height: 20,
+    borderRadius: 6,
+    borderWidth: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editObsLabel: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  editObsHint: {
+    fontSize: 10,
+    marginTop: 1,
+  },
+  editSeverityRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 8,
+    paddingLeft: 30,
+  },
+  editSeverityBtn: {
+    width: 30,
+    height: 28,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editSeverityLabel: {
+    flex: 1,
+    fontSize: 10,
+    fontWeight: '700',
+    textAlign: 'right',
   },
   formRow: {
     flexDirection: 'row',

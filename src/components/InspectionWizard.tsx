@@ -1,9 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import {
   StyleSheet,
-  Text,
   View,
-  TextInput,
   TouchableOpacity,
   ScrollView,
   Image,
@@ -13,9 +11,11 @@ import {
   useWindowDimensions,
   Modal,
 } from 'react-native';
+import { Text, TextInput } from '../ui/ScaledText';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
+import * as Network from 'expo-network';
 import { MaterialCommunityIcons, Feather } from '@expo/vector-icons';
 
 import {
@@ -25,10 +25,25 @@ import {
   TYPE_OPTIONS,
   OBSERVATIONS,
   CONDITION_LABELS,
+  buildObservations,
+  parseObservations,
+  materialKeyFromName,
 } from '../data/observations';
 import { PLAN_LIMITS, type Plan } from '../data/planLimits';
+import { API_BASE_URL } from '../config';
 import TsunamiMascot from './TsunamiMascot';
 import { generateAndSharePDF } from '../utils/exportUtils';
+import { isRealToken, isPermanentHttpError, photoRequestId } from '../utils/offline';
+
+// Sin red (o sin internet alcanzable) no se espera al timeout del servidor: se guarda directo en el dispositivo.
+async function hasConnection() {
+  try {
+    const net = await Network.getNetworkStateAsync();
+    return Boolean(net.isConnected && net.isInternetReachable !== false);
+  } catch {
+    return false;
+  }
+}
 
 const PHOTOS_DIR = `${FileSystem.documentDirectory || ''}inspect_offline_photos/`;
 
@@ -64,6 +79,26 @@ const MATERIAL_ICONS: Record<MaterialKey, { name: string; family: 'mci' | 'feath
 const LEVEL_PRESETS = ['Sótano 1', 'Nivel 01', 'Nivel 02', 'Nivel 03', 'Nivel 04', 'Azotea'];
 const CODE_PRESETS = ['C-01', 'V-101', 'L-01', 'M-01', 'P-01'];
 
+export interface WizardEditPayload {
+  data: {
+    projectId: number;
+    material: string;
+    elementType: string;
+    code: string;
+    axis: string;
+    level: string;
+    condition: number;
+    observations: string;
+    notes: string;
+  };
+  // Registro ya en el servidor: fotos nuevas por subir y fotos existentes por borrar.
+  addedPhotos: { uri: string; type: string }[];
+  removedPhotoIds: number[];
+  // Registro aún pendiente en el dispositivo: lista completa de archivos locales que quedan en la cola.
+  localPhotos?: { uri: string; type: string }[];
+  removedLocalUris: string[];
+}
+
 interface WizardProps {
   theme: any;
   projects: any[];
@@ -75,6 +110,9 @@ interface WizardProps {
   onSuccess: (inspection: any, localPhotos: { uri: string; type: string }[]) => void;
   showToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
   onAddProject?: (project: any) => void;
+  // Modo edición: el mismo flujo de 3 pasos, con los datos de la inspección ya cargados.
+  editing?: { inspection: any; localPhotos: { uri: string; type: string }[] };
+  onUpdate?: (payload: WizardEditPayload) => Promise<boolean>;
 }
 
 export const InspectionWizard: React.FC<WizardProps> = ({
@@ -88,6 +126,8 @@ export const InspectionWizard: React.FC<WizardProps> = ({
   onSuccess,
   showToast,
   onAddProject,
+  editing,
+  onUpdate,
 }) => {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
@@ -98,7 +138,16 @@ export const InspectionWizard: React.FC<WizardProps> = ({
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
 
   // Step 1: Geometry & Identification
-  const [projectId, setProjectId] = useState<number>(activeProjectId || projects[0]?.id || 0);
+  const editInsp = editing?.inspection;
+  const isLocalEdit = Boolean(editInsp && String(editInsp.id).startsWith('local_'));
+  const editParsed = useMemo(
+    () =>
+      editInsp
+        ? parseObservations(materialKeyFromName(editInsp.material) ?? 'other', editInsp.observations || '')
+        : null,
+    [],
+  );
+  const [projectId, setProjectId] = useState<number>(editInsp?.projectId || activeProjectId || projects[0]?.id || 0);
 
   useEffect(() => {
     if ((!projectId || !projects.some((p) => p.id === projectId)) && projects.length > 0) {
@@ -114,11 +163,13 @@ export const InspectionWizard: React.FC<WizardProps> = ({
   const [newProjClient, setNewProjClient] = useState('');
   const [creatingProject, setCreatingProject] = useState(false);
 
-  const [material, setMaterial] = useState<MaterialKey>('concrete');
-  const [elementType, setElementType] = useState<string>(TYPE_OPTIONS.concrete[0]);
-  const [code, setCode] = useState('C-01');
-  const [axis, setAxis] = useState('Eje A-1');
-  const [level, setLevel] = useState('Nivel 01');
+  const [material, setMaterial] = useState<MaterialKey>(
+    editInsp ? materialKeyFromName(editInsp.material) ?? 'other' : 'concrete',
+  );
+  const [elementType, setElementType] = useState<string>(editInsp?.elementType || TYPE_OPTIONS.concrete[0]);
+  const [code, setCode] = useState(editInsp?.code || 'C-01');
+  const [axis, setAxis] = useState(editInsp?.axis || 'Eje A-1');
+  const [level, setLevel] = useState(editInsp?.level || 'Nivel 01');
 
   const handleQuickCreateProject = async () => {
     if (!newProjName.trim()) {
@@ -141,17 +192,25 @@ export const InspectionWizard: React.FC<WizardProps> = ({
 
     try {
       let createdProj: any = null;
-      if (token && token !== 'offline-guest-token') {
-        const res = await fetch('https://inspect.vertexdev.tech/api/projects', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(newProjData),
-        });
-        if (res.ok) {
-          createdProj = await res.json();
+      if (isRealToken(token) && (await hasConnection())) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        try {
+          const res = await fetch(`${API_BASE_URL}/projects`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify(newProjData),
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutId);
+          if (res.ok) {
+            createdProj = await res.json();
+          }
+        } catch {
+          clearTimeout(timeoutId);
         }
       }
 
@@ -160,6 +219,8 @@ export const InspectionWizard: React.FC<WizardProps> = ({
           id: Date.now(),
           ...newProjData,
           createdAt: new Date().toISOString(),
+          // Se sube al servidor (antes que sus inspecciones) cuando haya conexión.
+          isLocalOnly: true,
         };
       }
 
@@ -181,17 +242,29 @@ export const InspectionWizard: React.FC<WizardProps> = ({
   };
 
   // Step 2: Pathologies & Severities
-  const [selectedObs, setSelectedObs] = useState<Record<string, number>>({});
+  const [selectedObs, setSelectedObs] = useState<Record<string, number>>(editParsed?.selected ?? {});
+  const [obsComments, setObsComments] = useState<Record<string, string>>(editParsed?.comments ?? {});
+  const [extraObs, setExtraObs] = useState(editParsed?.extra ?? '');
   const [obsSearch, setObsSearch] = useState('');
-  const [notes, setNotes] = useState('');
+  const [notes, setNotes] = useState(editInsp?.notes || '');
 
   // Step 3: Overall Condition & Photo Evidence
-  const [condition, setCondition] = useState<number>(2); // Default Bueno
-  const [photos, setPhotos] = useState<{ uri: string; type: string }[]>([]);
+  const [condition, setCondition] = useState<number>(editInsp?.condition || 2); // Default Bueno
+  // Nuevas fotos (o, en un registro aún local, todas sus fotos guardadas en el dispositivo)
+  const [photos, setPhotos] = useState<{ uri: string; type: string }[]>(
+    isLocalEdit ? (editing?.localPhotos || []).filter((p) => p.type !== 'audio') : [],
+  );
+  // Fotos que el registro ya tiene en el servidor (se pueden quitar al guardar)
+  const [existingPhotos, setExistingPhotos] = useState<any[]>(
+    editInsp && !isLocalEdit ? (editInsp.photos || []).filter((p: any) => p.photoType !== 'audio') : [],
+  );
+  const [removedPhotoIds, setRemovedPhotoIds] = useState<number[]>([]);
   const [saving, setSaving] = useState(false);
   const [createdInsp, setCreatedInsp] = useState<any>(null);
 
   const maxPhotos = limits.photosPerInspection;
+  const visibleExisting = existingPhotos.filter((p) => !removedPhotoIds.includes(p.id));
+  const totalPhotos = visibleExisting.length + photos.length;
 
   // Toggle observation on/off
   const toggleObservation = (obsId: string) => {
@@ -210,17 +283,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
   };
 
   // Compile observations string
-  const compileObservationsText = () => {
-    const obsCatalog = OBSERVATIONS[material] || [];
-    const entries = Object.entries(selectedObs);
-    if (entries.length === 0) return 'Sin patologías severas marcadas';
-    return entries
-      .map(([id, lvl]) => {
-        const item = obsCatalog.find((o) => o.id === id);
-        return `${item?.label || id} [Nivel ${lvl}]`;
-      })
-      .join('; ');
-  };
+  const compileObservationsText = () => buildObservations(material, selectedObs, extraObs, obsComments);
 
   // Filtered observations for Step 2
   const currentObsList = useMemo(() => {
@@ -234,7 +297,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
 
   // Photo handlers
   const handleTakePhoto = async () => {
-    if (photos.length >= maxPhotos) {
+    if (totalPhotos >= maxPhotos) {
       showToast(`Límite de ${maxPhotos} foto(s) alcanzado en tu plan.`, 'info');
       return;
     }
@@ -251,13 +314,13 @@ export const InspectionWizard: React.FC<WizardProps> = ({
     });
 
     if (!res.canceled && res.assets && res.assets.length > 0) {
-      const localUri = await savePhotoLocally(res.assets[0].uri, 'general');
-      setPhotos((prev) => [...prev, { uri: localUri, type: 'general' }]);
+      const localUri = await savePhotoLocally(res.assets[0].uri, 'foto');
+      setPhotos((prev) => [...prev, { uri: localUri, type: 'foto' }]);
     }
   };
 
   const handlePickGallery = async () => {
-    if (photos.length >= maxPhotos) {
+    if (totalPhotos >= maxPhotos) {
       showToast(`Límite de ${maxPhotos} foto(s) alcanzado en tu plan.`, 'info');
       return;
     }
@@ -274,10 +337,12 @@ export const InspectionWizard: React.FC<WizardProps> = ({
     });
 
     if (!res.canceled && res.assets) {
+      let count = totalPhotos;
       for (const a of res.assets) {
-        if (photos.length >= maxPhotos) break;
-        const localUri = await savePhotoLocally(a.uri, 'detail');
-        setPhotos((prev) => [...prev, { uri: localUri, type: 'detail' }]);
+        if (count >= maxPhotos) break;
+        count++;
+        const localUri = await savePhotoLocally(a.uri, 'foto');
+        setPhotos((prev) => [...prev, { uri: localUri, type: 'foto' }]);
       }
     }
   };
@@ -301,11 +366,42 @@ export const InspectionWizard: React.FC<WizardProps> = ({
       return;
     }
 
+    if (editing && onUpdate) {
+      setSaving(true);
+      try {
+        const initialLocal = editing.localPhotos.filter((p) => p.type !== 'audio').map((p) => p.uri);
+        const ok = await onUpdate({
+          data: {
+            projectId: Number(projectId),
+            material: MATERIAL_NAMES[material] || material,
+            elementType,
+            code: code.trim().toUpperCase(),
+            axis: axis.trim(),
+            level: level.trim(),
+            condition,
+            observations: compileObservationsText(),
+            notes: notes.trim(),
+          },
+          addedPhotos: isLocalEdit ? [] : photos,
+          removedPhotoIds,
+          localPhotos: isLocalEdit
+            ? [...editing.localPhotos.filter((p) => p.type === 'audio'), ...photos]
+            : undefined,
+          removedLocalUris: isLocalEdit ? initialLocal.filter((u) => !photos.some((p) => p.uri === u)) : [],
+        });
+        if (ok) onClose();
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
+
     setSaving(true);
     const observationsText = compileObservationsText();
+    const clientRequestId = `mob_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     const payload = {
       projectId: Number(projectId),
-      material,
+      material: MATERIAL_NAMES[material] || material,
       elementType,
       code: code.trim().toUpperCase(),
       axis: axis.trim(),
@@ -317,60 +413,106 @@ export const InspectionWizard: React.FC<WizardProps> = ({
 
     let inspectionObj: any = {
       id: 0,
+      clientRequestId,
       ...payload,
     };
+
+    const isOffline = !isRealToken(token) || !(await hasConnection());
+
+    if (isOffline) {
+      // Direct local storage mode
+      const localId = `local_${clientRequestId}`;
+      inspectionObj = {
+        id: localId,
+        clientRequestId,
+        ...payload,
+        createdAt: new Date().toISOString(),
+        isPendingSync: true,
+        photos: photos.map((p) => ({ url: p.uri, photoType: p.type || 'foto' })),
+      };
+      onSuccess(inspectionObj, photos);
+      showToast('Guardado en modo offline en tu dispositivo.', 'info');
+      setSaving(false);
+      setCreatedInsp(inspectionObj);
+      setStep(4);
+      return;
+    }
 
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        Authorization: `Bearer ${token}`,
       };
 
-      const res = await fetch('https://inspect.vertexdev.tech/api/inspections', {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+      const res = await fetch(`${API_BASE_URL}/inspections`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, clientRequestId }),
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
 
       if (!res.ok) throw new Error('Error al guardar en el servidor');
       const data = await res.json();
       inspectionObj = data;
 
       // Upload photos
+      let allPhotosUploaded = true;
       if (photos.length > 0 && data.id) {
-        for (const p of photos) {
+        for (let idx = 0; idx < photos.length; idx++) {
+          const p = photos[idx];
           try {
             const formData = new FormData();
-            const filename = p.uri.split('/').pop() || 'photo.jpg';
+            const filename = p.uri.split('/').pop() || `photo_${Date.now()}_${idx}.jpg`;
             formData.append('file', {
               uri: p.uri,
               name: filename,
               type: 'image/jpeg',
             } as any);
 
-            await fetch(
-              `https://inspect.vertexdev.tech/api/photos/upload/${data.id}?photoType=${p.type}`,
+            const pController = new AbortController();
+            const pTimeout = setTimeout(() => pController.abort(), 15000);
+
+            const photoRes = await fetch(
+              `${API_BASE_URL}/photos/upload/${data.id}?photoType=${p.type || 'foto'}&clientRequestId=${encodeURIComponent(photoRequestId(clientRequestId, p.uri))}`,
               {
                 method: 'POST',
-                headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+                headers: { Authorization: `Bearer ${token}` },
                 body: formData,
+                signal: pController.signal,
               }
             );
+            clearTimeout(pTimeout);
+            // Un rechazo definitivo del servidor (formato, límite) no se arregla reintentando desde la cola.
+            if (!photoRes.ok && !isPermanentHttpError({ status: photoRes.status })) allPhotosUploaded = false;
           } catch (pErr) {
             console.warn('Error uploading photo:', pErr);
+            allPhotosUploaded = false;
           }
         }
       }
-      onSuccess(inspectionObj, []);
+
+      if (allPhotosUploaded) {
+        onSuccess(inspectionObj, []);
+      } else {
+        // Some photos failed to upload: keep in pending queue for safe retry
+        inspectionObj.isPendingSync = true;
+        onSuccess(inspectionObj, photos);
+        showToast('Inspección creada. Las fotos pendientes se sincronizarán en cola.', 'info');
+      }
     } catch {
       // Offline fallback
-      const localId = `local_${Date.now()}`;
+      const localId = `local_${clientRequestId}`;
       inspectionObj = {
         id: localId,
+        clientRequestId,
         ...payload,
         createdAt: new Date().toISOString(),
         isPendingSync: true,
-        photos: photos.map((p) => ({ url: p.uri, photoType: p.type })),
+        photos: photos.map((p) => ({ url: p.uri, photoType: p.type || 'foto' })),
       };
       onSuccess(inspectionObj, photos);
       showToast('Guardado en cola offline de tu dispositivo.', 'info');
@@ -385,7 +527,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior="padding"
       style={[styles.container, { backgroundColor: theme.bg }]}
     >
       {/* ── TOP HEADER WITH STEP PILLS ── */}
@@ -405,7 +547,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
           </TouchableOpacity>
 
           <View style={styles.headerTitleCenter}>
-            <Text style={styles.headerEyebrow}>NUEVA INSPECCIÓN</Text>
+            <Text style={styles.headerEyebrow}>{editing ? 'EDITAR INSPECCIÓN' : 'NUEVA INSPECCIÓN'}</Text>
             <Text style={[styles.headerMainTitle, { color: theme.text }]}>
               {step === 1
                 ? 'Geometría y Material'
@@ -629,9 +771,11 @@ export const InspectionWizard: React.FC<WizardProps> = ({
                       },
                     ]}
                     onPress={() => {
+                      if (mKey === material) return;
                       setMaterial(mKey);
                       setElementType(TYPE_OPTIONS[mKey][0]);
                       setSelectedObs({});
+                      setObsComments({});
                     }}
                     activeOpacity={0.8}
                   >
@@ -888,12 +1032,40 @@ export const InspectionWizard: React.FC<WizardProps> = ({
                             );
                           })}
                         </View>
+                        <TextInput
+                          style={[
+                            styles.obsCommentInput,
+                            { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text },
+                          ]}
+                          placeholder="Comentario sobre esta patología (opcional)"
+                          placeholderTextColor={theme.textMuted}
+                          multiline
+                          value={obsComments[obs.id] || ''}
+                          onChangeText={(t) => setObsComments((prev) => ({ ...prev, [obs.id]: t }))}
+                        />
                       </View>
                     )}
                   </View>
                 );
               })}
             </View>
+
+            {editing && (
+              <View style={[styles.inputGroupCard, { backgroundColor: theme.card, borderColor: theme.border, marginTop: 14 }]}>
+                <Text style={[styles.inputLabel, { color: theme.textSecondary }]}>OTRAS OBSERVACIONES (TEXTO LIBRE)</Text>
+                <TextInput
+                  style={[
+                    styles.textArea,
+                    { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text },
+                  ]}
+                  placeholder="Otros hallazgos que no están en la lista..."
+                  placeholderTextColor={theme.textMuted}
+                  multiline
+                  value={extraObs}
+                  onChangeText={setExtraObs}
+                />
+              </View>
+            )}
 
             {/* Custom Notes */}
             <View style={[styles.inputGroupCard, { backgroundColor: theme.card, borderColor: theme.border, marginTop: 14 }]}>
@@ -984,7 +1156,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
                 <View>
                   <Text style={styles.headerEyebrow}>EVIDENCIA VISUAL</Text>
                   <Text style={[styles.sectionTitle, { color: theme.text }]}>
-                    Fotografías ({photos.length} / {maxPhotos})
+                    Fotografías ({totalPhotos} / {maxPhotos})
                   </Text>
                 </View>
                 {plan === 'free' && (
@@ -1015,8 +1187,19 @@ export const InspectionWizard: React.FC<WizardProps> = ({
               </View>
 
               {/* Photo Thumbnails */}
-              {photos.length > 0 ? (
+              {totalPhotos > 0 ? (
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.photoThumbList}>
+                  {visibleExisting.map((p) => (
+                    <View key={`existing-${p.id}`} style={styles.photoThumbCard}>
+                      <Image source={{ uri: p.url }} style={styles.photoThumbImg} />
+                      <TouchableOpacity
+                        style={styles.photoDeleteBtn}
+                        onPress={() => setRemovedPhotoIds((prev) => [...prev, p.id])}
+                      >
+                        <Feather name="x" size={12} color="#ffffff" />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
                   {photos.map((p, idx) => (
                     <View key={`thumb-${idx}`} style={styles.photoThumbCard}>
                       <Image source={{ uri: p.uri }} style={styles.photoThumbImg} />
@@ -1112,6 +1295,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
               style={[styles.pdfButton, { backgroundColor: theme.primary }]}
               onPress={() => {
                 generateAndSharePDF({
+                  token,
                   scope: 'inspection',
                   inspections: [createdInsp],
                   user,
@@ -1190,6 +1374,8 @@ export const InspectionWizard: React.FC<WizardProps> = ({
                   ? 'Siguiente: Patologías →'
                   : step === 2
                   ? 'Siguiente: Condición y Fotos →'
+                  : editing
+                  ? '✓ Guardar cambios'
                   : '✓ Finalizar y Guardar'}
               </Text>
             )}
@@ -1205,7 +1391,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
         onRequestClose={() => setShowQuickProjectModal(false)}
       >
         <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          behavior="padding"
           style={styles.modalOverlay}
         >
           <View style={[styles.quickProjectModalBox, { backgroundColor: theme.card, borderColor: theme.border }]}>
@@ -1539,6 +1725,16 @@ const styles = StyleSheet.create({
   searchInput: {
     flex: 1,
     fontSize: 12,
+  },
+  obsCommentInput: {
+    marginTop: 10,
+    minHeight: 44,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 13,
+    textAlignVertical: 'top',
   },
   obsCardsList: {
     gap: 8,

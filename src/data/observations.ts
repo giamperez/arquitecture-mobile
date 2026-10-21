@@ -130,9 +130,64 @@ export const CONDITION_LABELS: Record<number, string> = {
 };
 
 export const SEVERITY_LABELS: Record<number, string> = {
-  1: '1 – Muy leve',
-  2: '2 – Leve',
-  3: '3 – Moderado',
-  4: '4 – Severo',
-  5: '5 – Crítico',
+  1: '1 · Muy leve',
+  2: '2 · Leve',
+  3: '3 · Moderado',
+  4: '4 · Severo',
+  5: '5 · Crítico',
+};
+
+export const NO_OBSERVATIONS_TEXT = 'Sin hallazgos marcados';
+// Textos "sin hallazgos" que ha usado la app al guardar (el texto antiguo sigue reconociéndose)
+const EMPTY_OBSERVATION_TEXTS = [NO_OBSERVATIONS_TEXT, 'Sin patologías severas marcadas'];
+
+export const materialKeyFromName = (name: string): MaterialKey | null => {
+  const n = (name || '').trim().toLowerCase();
+  return MATERIAL_KEYS.find((k) => k === n || MATERIAL_NAMES[k].toLowerCase() === n) ?? null;
+};
+
+// Las observaciones se guardan como texto: "Fisuras o grietas [Nivel 2]: comentario opcional; Humedad o eflorescencia [Nivel 1]".
+// El comentario de cada patología va tras los dos puntos (sin ';' ni saltos de línea, que separan los elementos).
+// Para editar una inspección se vuelven a convertir en opciones marcadas; lo que no coincide con
+// el catálogo del material (texto libre) se conserva aparte en `extra`.
+export const parseObservations = (material: MaterialKey | null, text: string) => {
+  const list = material ? OBSERVATIONS[material] : [];
+  const selected: Record<string, number> = {};
+  const comments: Record<string, string> = {};
+  const extra: string[] = [];
+  (text || '')
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .forEach((part) => {
+      if (EMPTY_OBSERVATION_TEXTS.includes(part)) return;
+      const match = part.match(/^(.*?)\s*\[Nivel\s*(\d)\](?::\s*(.*))?$/);
+      const label = (match ? match[1] : part).trim();
+      const obs = list.find((o) => o.label === label);
+      if (obs) {
+        selected[obs.id] = match ? Number(match[2]) : 1;
+        if (match?.[3]?.trim()) comments[obs.id] = match[3].trim();
+      } else extra.push(part);
+    });
+  return { selected, comments, extra: extra.join('; ') };
+};
+
+export const cleanObservationComment = (text: string) => text.replace(/[;\r\n]+/g, ', ').replace(/\s+/g, ' ').trim();
+
+export const buildObservations = (
+  material: MaterialKey | null,
+  selected: Record<string, number>,
+  extra = '',
+  comments: Record<string, string> = {},
+) => {
+  const list = material ? OBSERVATIONS[material] : [];
+  const parts = list
+    .filter((o) => o.id in selected)
+    .map((o) => {
+      const comment = cleanObservationComment(comments[o.id] || '');
+      return `${o.label} [Nivel ${selected[o.id]}]${comment ? `: ${comment}` : ''}`;
+    });
+  const free = extra.trim();
+  if (free) parts.push(free);
+  return parts.length ? parts.join('; ') : NO_OBSERVATIONS_TEXT;
 };

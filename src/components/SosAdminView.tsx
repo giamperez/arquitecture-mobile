@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
-  Text,
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
@@ -9,6 +8,7 @@ import {
   Linking,
   RefreshControl,
 } from 'react-native';
+import { Text } from '../ui/ScaledText';
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import SosButton from './SosButton';
 

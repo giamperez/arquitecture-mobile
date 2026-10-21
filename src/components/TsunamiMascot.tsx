@@ -5,8 +5,8 @@ import {
   StyleSheet,
   Animated,
   Easing,
-  Text,
 } from 'react-native';
+import { Text } from '../ui/ScaledText';
 
 export type TsunamiPose = 'idle' | 'running' | 'alert' | 'celebrating' | 'sleeping';
 

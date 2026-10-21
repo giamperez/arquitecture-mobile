@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import {
   TouchableOpacity,
-  Text,
   StyleSheet,
   ActivityIndicator,
   View,
@@ -9,6 +8,7 @@ import {
   Alert,
   Platform,
 } from 'react-native';
+import { Text } from '../ui/ScaledText';
 import * as Location from 'expo-location';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 
