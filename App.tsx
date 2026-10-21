@@ -51,6 +51,8 @@ import SosAdminView from './src/components/SosAdminView';
 import InspectionWizard, { type WizardEditPayload } from './src/components/InspectionWizard';
 import { generateAndSharePDF, generateAndShareExcel, setPdfHooks } from './src/utils/exportUtils';
 import { runSync } from './src/utils/syncEngine';
+import { uploadMedia } from './src/utils/mediaUpload';
+import { mediaUrlFor } from './src/utils/pdfReport';
 import {
   STORAGE_KEYS,
   isRealToken,
@@ -592,15 +594,7 @@ function MainApp() {
       try {
         const result = await runSync([...pendingRef.current], pendingProjects, {
           api: (path, options, timeoutMs) => apiRequest(path, options as RequestInit, token, timeoutMs),
-          buildPhotoBody: (photo) => {
-            const formData = new FormData();
-            formData.append('file', {
-              uri: photo.uri,
-              name: photo.uri.split('/').pop() || `media_${Date.now()}`,
-              type: photo.type === 'audio' ? 'audio/mp4' : 'image/jpeg',
-            } as any);
-            return formData;
-          },
+          uploadMedia: (inspectionId, photo, requestId) => uploadMedia(token as string, inspectionId, photo, requestId),
         });
         authLost = result.authLost;
         syncedCount = result.syncedCount;
@@ -648,7 +642,10 @@ function MainApp() {
         }
 
         if (result.droppedMedia > 0) {
-          showToast(`${result.droppedMedia} archivo(s) fueron rechazados por el servidor (formato o límite) y se descartaron.`, 'error');
+          showToast(
+            `${result.droppedMedia} archivo(s) fueron rechazados por el servidor y se descartaron: ${result.mediaErrors.join(' / ') || 'formato o límite'}`,
+            'error'
+          );
         }
       } finally {
         syncingRef.current = false;
@@ -1131,6 +1128,7 @@ function MainApp() {
       await apiRequest(`/inspections/${insp.id}`, { method: 'PATCH', body: JSON.stringify(p.data) }, token);
 
       let failedMedia = 0;
+      const mediaReasons: string[] = [];
       for (const photoId of p.removedPhotoIds) {
         try {
           await apiRequest(`/photos/${photoId}`, { method: 'DELETE' }, token);
@@ -1140,23 +1138,11 @@ function MainApp() {
       }
       for (const photo of p.addedPhotos) {
         try {
-          const formData = new FormData();
-          formData.append('file', {
-            uri: photo.uri,
-            name: photo.uri.split('/').pop() || `photo_${Date.now()}.jpg`,
-            type: 'image/jpeg',
-          } as any);
-          await apiRequest(
-            `/photos/upload/${insp.id}?photoType=foto&clientRequestId=${encodeURIComponent(
-              photoRequestId(`edit_${insp.id}`, photo.uri)
-            )}`,
-            { method: 'POST', body: formData },
-            token,
-            30000
-          );
+          await uploadMedia(token as string, Number(insp.id), photo, photoRequestId(`edit_${insp.id}`, photo.uri));
           deleteLocalFiles([photo.uri]);
-        } catch {
+        } catch (mErr: any) {
           failedMedia++;
+          if (mErr?.message && !mediaReasons.includes(mErr.message)) mediaReasons.push(mErr.message);
         }
       }
 
@@ -1172,7 +1158,7 @@ function MainApp() {
       storeInspection({ ...insp, ...p.data, photos });
       showToast(
         failedMedia > 0
-          ? `Inspección actualizada, pero ${failedMedia} foto(s) no se pudieron actualizar.`
+          ? `Inspección actualizada, pero ${failedMedia} foto(s) no se pudieron actualizar${mediaReasons.length ? `: ${mediaReasons.join(' / ')}` : '.'}`
           : 'Inspección actualizada',
         failedMedia > 0 ? 'info' : 'success'
       );
@@ -3295,8 +3281,8 @@ function InspectionDetailModal({
                       </Text>
                       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 6 }}>
                         {normalPhotos.map((p, idx) => (
-                          <TouchableOpacity key={`det-p-${idx}`} onPress={() => onPreviewImage(p.url)}>
-                            <Image source={{ uri: p.url }} style={styles.detailPhotoItem} />
+                          <TouchableOpacity key={`det-p-${idx}`} onPress={() => onPreviewImage(mediaUrlFor(API_BASE_URL, p.url))}>
+                            <Image source={{ uri: mediaUrlFor(API_BASE_URL, p.url) }} style={styles.detailPhotoItem} />
                           </TouchableOpacity>
                         ))}
                       </ScrollView>
@@ -3322,7 +3308,7 @@ function InspectionDetailModal({
                               borderColor: theme.border,
                             }}
                             onPress={() => {
-                              if (a.url) Linking.openURL(a.url).catch(() => {});
+                              if (a.url) Linking.openURL(mediaUrlFor(API_BASE_URL, a.url)).catch(() => {});
                             }}
                           >
                             <MaterialCommunityIcons name="microphone" size={20} color={theme.primary} />

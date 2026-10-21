@@ -34,6 +34,8 @@ import { API_BASE_URL } from '../config';
 import TsunamiMascot from './TsunamiMascot';
 import { generateAndSharePDF } from '../utils/exportUtils';
 import { isRealToken, isPermanentHttpError, photoRequestId } from '../utils/offline';
+import { uploadMedia, normalizePhoto } from '../utils/mediaUpload';
+import { mediaUrlFor } from '../utils/pdfReport';
 
 // Sin red (o sin internet alcanzable) no se espera al timeout del servidor: se guarda directo en el dispositivo.
 async function hasConnection() {
@@ -58,11 +60,18 @@ async function ensurePhotosDirectory() {
   }
 }
 
-async function savePhotoLocally(tempUri: string, type: string): Promise<string> {
+async function savePhotoLocally(tempUri: string, type: string, width?: number): Promise<string> {
   await ensurePhotosDirectory();
-  const filename = `photo_${Date.now()}_${type}_${Math.floor(Math.random() * 1000)}.jpg`;
+  const filename = `photo_${Date.now()}_${type}_${Math.floor(Math.random() * 100000)}.jpg`;
   const destUri = `${PHOTOS_DIR}${filename}`;
-  await FileSystem.copyAsync({ from: tempUri, to: destUri });
+  // Se guarda siempre como JPEG (los HEIC/PNG de la galería no los admite el servidor) y reducida
+  let source = tempUri;
+  try {
+    source = await normalizePhoto(tempUri, width);
+  } catch (e) {
+    console.warn('No se pudo normalizar la foto, se guarda tal cual:', e);
+  }
+  await FileSystem.copyAsync({ from: source, to: destUri });
   return destUri;
 }
 
@@ -314,7 +323,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
     });
 
     if (!res.canceled && res.assets && res.assets.length > 0) {
-      const localUri = await savePhotoLocally(res.assets[0].uri, 'foto');
+      const localUri = await savePhotoLocally(res.assets[0].uri, 'foto', res.assets[0].width);
       setPhotos((prev) => [...prev, { uri: localUri, type: 'foto' }]);
     }
   };
@@ -341,7 +350,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
       for (const a of res.assets) {
         if (count >= maxPhotos) break;
         count++;
-        const localUri = await savePhotoLocally(a.uri, 'foto');
+        const localUri = await savePhotoLocally(a.uri, 'foto', a.width);
         setPhotos((prev) => [...prev, { uri: localUri, type: 'foto' }]);
       }
     }
@@ -459,40 +468,31 @@ export const InspectionWizard: React.FC<WizardProps> = ({
       const data = await res.json();
       inspectionObj = data;
 
-      // Upload photos
+      // Upload photos (subida nativa; si el servidor rechaza un archivo se muestra el motivo real)
       let allPhotosUploaded = true;
+      const uploaded: any[] = [];
+      const rejectedReasons: string[] = [];
+      let rejected = 0;
       if (photos.length > 0 && data.id) {
-        for (let idx = 0; idx < photos.length; idx++) {
-          const p = photos[idx];
+        for (const p of photos) {
           try {
-            const formData = new FormData();
-            const filename = p.uri.split('/').pop() || `photo_${Date.now()}_${idx}.jpg`;
-            formData.append('file', {
-              uri: p.uri,
-              name: filename,
-              type: 'image/jpeg',
-            } as any);
-
-            const pController = new AbortController();
-            const pTimeout = setTimeout(() => pController.abort(), 15000);
-
-            const photoRes = await fetch(
-              `${API_BASE_URL}/photos/upload/${data.id}?photoType=${p.type || 'foto'}&clientRequestId=${encodeURIComponent(photoRequestId(clientRequestId, p.uri))}`,
-              {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
-                body: formData,
-                signal: pController.signal,
-              }
-            );
-            clearTimeout(pTimeout);
-            // Un rechazo definitivo del servidor (formato, límite) no se arregla reintentando desde la cola.
-            if (!photoRes.ok && !isPermanentHttpError({ status: photoRes.status })) allPhotosUploaded = false;
-          } catch (pErr) {
+            uploaded.push(await uploadMedia(token as string, data.id, p, photoRequestId(clientRequestId, p.uri)));
+          } catch (pErr: any) {
             console.warn('Error uploading photo:', pErr);
-            allPhotosUploaded = false;
+            if (isPermanentHttpError(pErr)) {
+              // Un rechazo definitivo del servidor (formato, límite) no se arregla reintentando desde la cola.
+              rejected++;
+              if (pErr?.message && !rejectedReasons.includes(pErr.message)) rejectedReasons.push(pErr.message);
+            } else {
+              allPhotosUploaded = false;
+            }
           }
         }
+        // La lista muestra de inmediato las fotos que ya están en el servidor
+        inspectionObj = { ...inspectionObj, photos: uploaded };
+      }
+      if (rejected > 0) {
+        showToast(`${rejected} foto(s) no se pudieron subir: ${rejectedReasons.join(' / ') || 'rechazadas por el servidor'}`, 'error');
       }
 
       if (allPhotosUploaded) {
@@ -1191,7 +1191,7 @@ export const InspectionWizard: React.FC<WizardProps> = ({
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.photoThumbList}>
                   {visibleExisting.map((p) => (
                     <View key={`existing-${p.id}`} style={styles.photoThumbCard}>
-                      <Image source={{ uri: p.url }} style={styles.photoThumbImg} />
+                      <Image source={{ uri: mediaUrlFor(API_BASE_URL, p.url) }} style={styles.photoThumbImg} />
                       <TouchableOpacity
                         style={styles.photoDeleteBtn}
                         onPress={() => setRemovedPhotoIds((prev) => [...prev, p.id])}

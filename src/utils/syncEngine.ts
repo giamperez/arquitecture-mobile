@@ -17,13 +17,16 @@ export interface SyncItem {
 
 export interface SyncDeps {
   api: (path: string, options: { method: string; body?: any }, timeoutMs?: number) => Promise<any>;
-  buildPhotoBody: (photo: SyncPhoto) => any;
+  // Sube un archivo a una inspección ya creada. Lanza error con `status` si el servidor lo rechaza, sin `status` si no hay red.
+  uploadMedia: (inspectionId: number, photo: SyncPhoto, requestId: string) => Promise<any>;
 }
 
 export interface SyncResult {
   authLost: boolean;
   syncedCount: number;
   droppedMedia: number;
+  // Motivos (mensajes del servidor) por los que algún archivo no se pudo subir
+  mediaErrors: string[];
   remainingProjects: any[];
   projectIdMap: Record<number, number>;
   createdProjects: Record<number, any>;
@@ -43,6 +46,7 @@ export async function runSync(queue: SyncItem[], pendingProjects: any[], deps: S
     authLost: false,
     syncedCount: 0,
     droppedMedia: 0,
+    mediaErrors: [],
     remainingProjects: [],
     projectIdMap: {},
     createdProjects: {},
@@ -130,15 +134,11 @@ export async function runSync(queue: SyncItem[], pendingProjects: any[], deps: S
       let transientFailure = false;
       for (const photo of photos) {
         try {
-          const photoType = photo.type === 'audio' ? 'audio' : 'foto';
-          await deps.api(
-            `/photos/upload/${created.id}?photoType=${photoType}&clientRequestId=${encodeURIComponent(
-              photoRequestId(clientReqId, photo.uri)
-            )}`,
-            { method: 'POST', body: deps.buildPhotoBody(photo) },
-            30000
-          );
+          await deps.uploadMedia(created.id, photo, photoRequestId(clientReqId, photo.uri));
         } catch (pErr: any) {
+          if (pErr?.status !== undefined && pErr?.message && !result.mediaErrors.includes(pErr.message)) {
+            result.mediaErrors.push(pErr.message);
+          }
           if (pErr?.status === 401) {
             result.authLost = true;
             transientFailure = true;
